@@ -1,9 +1,14 @@
 streamlit
 yfinance
 pandas
+numpy
+scipy
+scikit-learn
 requests
 beautifulsoup4
 python-dotenv
 openai
 anthropic
 plotly
+rich
+ta
