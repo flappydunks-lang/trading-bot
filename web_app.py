@@ -82,7 +82,7 @@ def login_page():
 
 # Main app
 def main_app():
-    from Trading import ConfigurationManager, DataManager, TechnicalAnalyzer
+    from Trading import ConfigurationManager, DataManager, TechnicalAnalyzer, UserManager
     
     # Sidebar navigation
     st.sidebar.title(f"🤖 FinalAI Quantum")
