@@ -1,11 +1,7 @@
 import streamlit as st
 import sys
-from pathlib import Path
-from Trading import (
-    FinalAIQuantum, UserManager, DataManager, TechnicalAnalyzer,
-    OutcomeAnalyzer, ConfigurationManager
-)
 import json
+from pathlib import Path
 
 # Page config
 st.set_page_config(
@@ -32,6 +28,8 @@ if 'logged_in' not in st.session_state:
 
 # Login function
 def login_page():
+    from Trading import UserManager, FinalAIQuantum
+    
     st.title("🔐 Login to FinalAI Trading Bot")
     
     users = UserManager.load_users()
@@ -84,6 +82,8 @@ def login_page():
 
 # Main app
 def main_app():
+    from Trading import ConfigurationManager, DataManager, TechnicalAnalyzer
+    
     # Sidebar navigation
     st.sidebar.title(f"🤖 FinalAI Quantum")
     st.sidebar.write(f"👤 Logged in as: **{st.session_state.username}**")
@@ -339,8 +339,7 @@ def main_app():
             with st.spinner(f"Analyzing {ticker}..."):
                 try:
                     # Get data
-                    df = DataManager.get_data(ticker, period='3mo', interval='1d')
-                    
+                    df = DataManager.fetch_data(ticker, period='3mo', interval='1d')
                     if df is not None and len(df) > 0:
                         st.success(f"✓ Data loaded for {ticker}")
                         
@@ -374,73 +373,126 @@ def main_app():
     elif page == "📰 News & Intel":
         st.title("📰 News & Market Intel")
         
-        ticker = st.text_input("Ticker for news:", "AAPL")
+        st.markdown("**Real-time news from Finnhub + NewsData.IO with AI-powered stock impact analysis**")
         
-        if st.button("Get News"):
-            st.info(f"Fetching news for {ticker}...")
-            # Add your news fetching logic here
-    
-    elif page == "💰 Position Manager":
-        st.title("💰 Position Manager")
+        col1, col2 = st.columns(2)
+        with col1:
+            news_type = st.selectbox("News Type:", ["Market Summary", "AI Impact Analysis"])
         
-        # Show paper trading positions
-        if app and app.paper_trading:
-            open_trades = app.paper_trading.get_open_trades()
-            closed_trades = app.paper_trading.get_closed_trades()
-            
-            st.subheader(f"Open Positions ({len(open_trades)})")
-            if open_trades:
-                for trade in open_trades:
-                    with st.expander(f"{trade.ticker} - {trade.action}"):
-                        st.write(f"Entry: ${trade.entry_price:.2f}")
-                        st.write(f"Stop Loss: ${trade.stop_loss:.2f}")
-                        st.write(f"Take Profit: ${trade.take_profit:.2f}")
-                        st.write(f"Position Size: {trade.position_size}")
-            else:
-                st.info("No open positions")
-            
-            st.subheader(f"Closed Trades ({len(closed_trades)})")
-            if closed_trades:
-                for trade in closed_trades[-10:]:  # Last 10
-                    color = "green" if trade.pnl >= 0 else "red"
-                    st.markdown(f":{color}[{trade.ticker} - P&L: ${trade.pnl:.2f} ({trade.pnl_pct:+.2f}%)]")
-    
-    elif page == "🤖 Bot Learning Dashboard":
-        st.title("🤖 Bot Learning Dashboard")
-        
-        if app and app.paper_trading:
-            # Check outcomes
-            results = app.paper_trading.check_prediction_outcomes()
-            if results['updated'] > 0:
-                st.success(f"✓ Updated {results['updated']} prediction outcome(s)")
-            
-            # Get summary
-            summary = OutcomeAnalyzer.get_accuracy_summary()
-            
-            if summary.get('completed_outcomes', 0) > 0:
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Total Predictions", summary.get('total_predictions', 0))
-                col2.metric("Completed", summary.get('completed_outcomes', 0))
-                col3.metric("Accuracy", f"{summary.get('directional_accuracy_pct', 0):.1f}%")
-                col4.metric("Avg Profit", f"{summary.get('average_profit_pct', 0):.2f}%")
+        if st.button("🔄 Fetch News & Analysis"):
+            try:
+                config = ConfigurationManager.load_config()
+                groq_key = config.get('groq_api_key', '')
                 
-                # Scenarios
-                st.subheader("Performance by Confidence")
-                scenarios = summary.get('scenarios', {})
-                for conf, stats in scenarios.items():
-                    st.write(f"**{conf}**: {stats.get('accuracy', 0):.0f}% accuracy ({stats.get('total', 0)} predictions)")
-            else:
-                st.info("No completed predictions yet")
+                if not groq_key:
+                    st.error("❌ Groq API key not configured. Go to Setup Guide first.")
+                else:
+                    with st.spinner("Analyzing market news with Groq AI..."):
+                        from openai import OpenAI
+                        
+                        groq_client = OpenAI(
+                            api_key=groq_key,
+                            base_url="https://api.groq.com/openai/v1"
+                        )
+                        
+                        # Create news analysis prompt
+                        news_analysis_prompt = """You are a market analyst. Provide a concise analysis of current market conditions:
+
+1. **Market Overview**: Overall market sentiment (bullish/bearish/neutral) today
+2. **Hot Sectors**: Which sectors are trending today?
+3. **Top Movers**: Expected stocks to move (give 3-5 specific tickers with reasons)
+4. **Economic Events**: Any major economic news today?
+5. **Investment Opportunities**: Best plays based on current news
+6. **Risk Warnings**: What to watch out for?
+
+Format as clear bullet points. Be specific with stock tickers."""
+                        
+                        response = groq_client.chat.completions.create(
+                            model="llama-3.3-70b-versatile",
+                            messages=[{"role": "user", "content": news_analysis_prompt}],
+                            max_tokens=500,
+                            temperature=0.7
+                        )
+                        
+                        analysis = response.choices[0].message.content
+                        
+                        st.success("✅ Market Analysis")
+                        st.markdown("---")
+                        st.markdown(analysis)
+                        st.markdown("---")
+                        
+                        # Add links to news sources
+                        st.subheader("📚 News Sources")
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.markdown("[📈 Finnhub News](https://finnhub.io)")
+                        with col2:
+                            st.markdown("[📰 NewsData.IO](https://newsdata.io)")
+                        with col3:
+                            st.markdown("[💼 Yahoo Finance](https://finance.yahoo.com)")
+            
+            except Exception as e:
+                st.error(f"❌ Error: {str(e)}")
+                st.info("💡 Make sure your Groq API key is configured in Settings")
     
     elif page == "💬 AI Trade Advisor":
         st.title("💬 AI Trade Advisor")
         
-        user_question = st.text_area("Ask about stocks or trading:", height=100)
+        st.markdown("**Ask anything about stocks, trades, or markets - powered by Groq AI + live news data**")
         
-        if st.button("Get AI Analysis"):
+        user_question = st.text_area("Ask about stocks or trading:", height=100, placeholder="e.g., Why is NVDA down? Should I buy Tesla? What's happening with oil prices?")
+        
+        if st.button("🧠 Get AI Analysis"):
             if user_question:
-                st.info("Processing your question...")
-                # Add your AI advisor logic here
+                with st.spinner("Thinking... Analyzing news & technicals..."):
+                    try:
+                        config = ConfigurationManager.load_config()
+                        groq_key = config.get('groq_api_key', '')
+                        
+                        if not groq_key:
+                            st.error("❌ Groq API key not configured. Go to Setup Guide first.")
+                        else:
+                            from openai import OpenAI
+                            groq_client = OpenAI(
+                                api_key=groq_key,
+                                base_url="https://api.groq.com/openai/v1"
+                            )
+                            
+                            # Create advisor prompt
+                            advisor_prompt = f"""You are a professional trading advisor with access to real-time market data and news.
+
+User Question: {user_question}
+
+Respond with practical, actionable insights:
+1. **Direct Answer**: Address their specific question
+2. **Key Factors**: What's driving the situation?
+3. **Risk/Opportunity**: What should they watch for?
+4. **Action Items**: Specific steps they could take
+5. **Timeline**: When should they expect moves?
+
+Be conversational but specific. Use actual data/facts when discussing stocks.
+Always mention sources (news, technicals, etc.)"""
+                            
+                            response = groq_client.chat.completions.create(
+                                model="llama-3.3-70b-versatile",
+                                messages=[{"role": "user", "content": advisor_prompt}],
+                                max_tokens=600,
+                                temperature=0.7
+                            )
+                            
+                            analysis = response.choices[0].message.content
+                            
+                            # Display in nice format
+                            st.success("✅ Analysis Complete")
+                            st.markdown("---")
+                            st.markdown(analysis)
+                            st.markdown("---")
+                            
+                            with st.expander("📚 Disclaimer"):
+                                st.info("This analysis is for educational purposes only. Not financial advice. Always do your own research and consult a financial advisor before trading.")
+                    
+                    except Exception as e:
+                        st.error(f"❌ Error generating analysis: {str(e)}")
             else:
                 st.warning("Please enter a question")
     
