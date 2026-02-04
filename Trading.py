@@ -17,7 +17,7 @@ Features:
 - Insider Trading Detection
 - Theme-Based Research (e.g., quantum computing)
 """
-
+from __future__ import annotations
 import os
 import sys
 import json
@@ -17552,4 +17552,5 @@ def main():
         console.print("[dim]Check logs for details[/dim]")
 
 if __name__ == "__main__":
+
     main()
