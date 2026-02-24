@@ -467,37 +467,40 @@ def main_app():
                         predictor=SimpleMomentumPredictor()
                     )
 
-                    st.subheader("Backtest Metrics")
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Total Trades", metrics.total_trades)
-                    m2.metric("Win Rate", f"{metrics.win_rate:.1f}%")
-                    m3.metric("Total P&L", f"${metrics.total_pnl:,.2f}")
-                    m4.metric("Max Drawdown", f"{metrics.max_drawdown:.1f}%")
-
-                    m5, m6, m7, m8 = st.columns(4)
-                    m5.metric("Profit Factor", f"{metrics.profit_factor:.2f}")
-                    m6.metric("Sharpe", f"{metrics.sharpe_ratio:.2f}")
-                    m7.metric("Sortino", f"{metrics.sortino_ratio:.2f}")
-                    m8.metric("Expectancy", f"{metrics.expectancy:.2f}")
-
-                    if engine.trades:
-                        st.subheader("Trades")
-                        trade_rows = []
-                        for t in engine.trades:
-                            trade_rows.append({
-                                "Entry Date": getattr(t.entry_date, 'date', lambda: t.entry_date)(),
-                                "Exit Date": getattr(t.exit_date, 'date', lambda: t.exit_date)(),
-                                "Direction": t.direction,
-                                "Entry": round(t.entry_price, 2),
-                                "Exit": round(t.exit_price, 2),
-                                "Shares": t.shares,
-                                "PnL": round(t.pnl, 2),
-                                "PnL %": round(t.pnl_percent, 2),
-                                "Win": t.win
-                            })
-                        st.dataframe(trade_rows, use_container_width=True)
+                    if metrics is None:
+                        st.error("❌ Backtest failed to generate metrics. Please check the ticker symbol and date range.")
                     else:
-                        st.info("No trades generated for this period with the current predictor.")
+                        st.subheader("Backtest Metrics")
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Total Trades", metrics.total_trades)
+                        m2.metric("Win Rate", f"{metrics.win_rate:.1f}%")
+                        m3.metric("Total P&L", f"${metrics.total_pnl:,.2f}")
+                        m4.metric("Max Drawdown", f"{metrics.max_drawdown:.1f}%")
+
+                        m5, m6, m7, m8 = st.columns(4)
+                        m5.metric("Profit Factor", f"{metrics.profit_factor:.2f}")
+                        m6.metric("Sharpe", f"{metrics.sharpe_ratio:.2f}")
+                        m7.metric("Sortino", f"{metrics.sortino_ratio:.2f}")
+                        m8.metric("Expectancy", f"{metrics.expectancy:.2f}")
+
+                        if engine.trades:
+                            st.subheader("Trades")
+                            trade_rows = []
+                            for t in engine.trades:
+                                trade_rows.append({
+                                    "Entry Date": getattr(t.entry_date, 'date', lambda: t.entry_date)(),
+                                    "Exit Date": getattr(t.exit_date, 'date', lambda: t.exit_date)(),
+                                    "Direction": t.direction,
+                                    "Entry": round(t.entry_price, 2),
+                                    "Exit": round(t.exit_price, 2),
+                                    "Shares": t.shares,
+                                    "PnL": round(t.pnl, 2),
+                                    "PnL %": round(t.pnl_percent, 2),
+                                    "Win": t.win
+                                })
+                            st.dataframe(trade_rows, use_container_width=True)
+                        else:
+                            st.info("No trades generated for this period with the current predictor.")
     
     elif page == "📰 News & Intel":
         st.title("📰 News & Market Intel")
@@ -818,60 +821,85 @@ Base analysis ONLY on the news provided."""
                             
                             news_context = []
                             
-                            # Fetch general market news from NewsData.IO FIRST
+                            # Fetch COMPREHENSIVE market news from NewsData.IO - Multiple queries for full coverage
                             if newsdata_key:
-                                st.info("📰 Fetching NewsData.IO market news...")
+                                st.info("📰 Scanning ALL factors that can affect this asset...")
                                 
                                 try:
-                                    # Build search query based on mentioned assets
-                                    search_terms = []
+                                    # Build comprehensive search queries - make MULTIPLE API calls
+                                    search_queries = []
                                     
-                                    # If specific commodity/ticker mentioned, search for it
+                                    # 1. Primary asset/ticker specific queries
                                     if 'gold' in user_question.lower():
-                                        search_terms.append('gold price')
-                                        search_terms.append('gold rally')
-                                        search_terms.append('precious metals')
-                                    elif 'oil' in user_question.lower():
-                                        search_terms.append('oil price')
-                                        search_terms.append('crude oil')
-                                    else:
-                                        # General market keywords
-                                        search_terms = ['market news', 'Fed', 'interest rates', 'inflation', 'economy']
-                                    
-                                    # Always add macro keywords
-                                    search_terms.extend(['economy', 'Fed decision', 'inflation', 'dollar'])
-                                    
-                                    # Search with actual ticker symbols too
-                                    for ticker in potential_tickers[:2]:
-                                        if ticker in ['GC=F', 'CL=F', 'BTC-USD']:
-                                            # Use human-readable names
-                                            search_terms.append('gold' if ticker == 'GC=F' else 'oil' if ticker == 'CL=F' else 'bitcoin')
+                                        search_queries.extend(['gold', 'precious metals', 'dollar', 'inflation', 'Fed'])
+                                    elif 'oil' in user_question.lower() or 'crude' in user_question.lower():
+                                        search_queries.extend(['oil', 'crude oil', 'OPEC', 'energy', 'gasoline'])
+                                    elif 'bitcoin' in user_question.lower() or 'btc' in user_question.lower() or 'crypto' in user_question.lower():
+                                        search_queries.extend(['bitcoin', 'cryptocurrency', 'crypto regulation', 'ethereum'])
+                                    elif potential_tickers:
+                                        first_ticker = potential_tickers[0]
+                                        if first_ticker == 'GC=F':
+                                            search_queries.extend(['gold', 'precious metals', 'dollar', 'inflation'])
+                                        elif first_ticker == 'CL=F':
+                                            search_queries.extend(['oil', 'OPEC', 'energy', 'gasoline'])
+                                        elif first_ticker == 'BTC-USD':
+                                            search_queries.extend(['bitcoin', 'cryptocurrency', 'crypto regulation'])
                                         else:
-                                            search_terms.append(ticker)
+                                            # Stock ticker - search ticker + broader context
+                                            search_queries.append(first_ticker)
                                     
-                                    query = ' OR '.join(search_terms[:8])
+                                    # 2. ALWAYS add economic/geopolitical factors that affect ALL markets
+                                    search_queries.extend([
+                                        'Federal Reserve',
+                                        'interest rates',
+                                        'stock market',
+                                        'economy'
+                                    ])
                                     
-                                    url = f"https://newsdata.io/api/1/news?apikey={newsdata_key}&q={query}&language=en&category=business&sortby=date"
-                                    st.write(f"   Query: {query}")
-                                    resp = requests.get(url, timeout=10)
+                                    # Remove duplicates while preserving order
+                                    seen = set()
+                                    search_queries = [x for x in search_queries if not (x in seen or seen.add(x))]
                                     
-                                    if resp.status_code == 200:
-                                        data = resp.json()
-                                        articles = data.get('results', [])[:10]
+                                    # Limit to 8 queries to avoid rate limits
+                                    search_queries = search_queries[:8]
+                                    
+                                    st.write(f"   🔍 Running {len(search_queries)} comprehensive searches...")
+                                    articles_found = 0
+                                    
+                                    for query in search_queries:
+                                        try:
+                                            url = f"https://newsdata.io/api/1/news?apikey={newsdata_key}&q={query}&language=en&category=business"
+                                            st.write(f"      • Searching: {query}")
+                                            resp = requests.get(url, timeout=10)
+                                            
+                                            if resp.status_code == 200:
+                                                data = resp.json()
+                                                articles = data.get('results', [])[:3]  # Take top 3 from each query
+                                                
+                                                if articles:
+                                                    articles_found += len(articles)
+                                                    for article in articles:
+                                                        # Deduplicate by headline
+                                                        headline = article.get('title', '')
+                                                        if not any(n['headline'] == headline for n in news_context):
+                                                            news_context.append({
+                                                                'source': f"NewsData - {article.get('source_id', 'Unknown')}",
+                                                                'headline': headline,
+                                                                'summary': article.get('description', '')[:200] if article.get('description') else '',
+                                                                'datetime': article.get('pubDate', 'Recent'),
+                                                                'query': query  # Track which query found this
+                                                            })
+                                                    st.write(f"         ✓ {len(articles)} articles")
+                                            else:
+                                                st.write(f"         ⚠️ No results ({resp.status_code})")
+                                        except Exception as e:
+                                            st.write(f"         ❌ Error: {str(e)}")
+                                    
+                                    if articles_found > 0:
+                                        st.success(f"✅ Found {len(news_context)} unique articles across {len(search_queries)} topics")
+                                    else:
+                                        st.warning("⚠️ No articles found from NewsData.IO")
                                         
-                                        if articles:
-                                            st.success(f"✅ Found {len(articles)} articles from NewsData.IO")
-                                            for article in articles:
-                                                news_context.append({
-                                                    'source': f"NewsData - {article.get('source_id', 'Unknown')}",
-                                                    'headline': article.get('title', ''),
-                                                    'summary': article.get('description', '')[:200] if article.get('description') else '',
-                                                    'datetime': article.get('pubDate', 'Recent')
-                                                })
-                                        else:
-                                            st.warning("⚠️ No articles found with that query")
-                                    else:
-                                        st.error(f"❌ NewsData.IO API error: {resp.status_code}")
                                 except Exception as e:
                                     st.error(f"❌ NewsData.IO error: {str(e)}")
                             
