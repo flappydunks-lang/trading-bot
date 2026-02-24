@@ -522,41 +522,26 @@ def main_app():
                             if name in question_lower:
                                 potential_tickers.append(ticker)
                         
-                        # Fetch prices
+                        # Fetch prices with rate limit handling
+                        import time
                         price_data = {}
                         if potential_tickers:
                             with feedback_container:
                                 st.info(f"💰 Fetching LIVE real-time prices for: {', '.join(set(potential_tickers[:5]))}")
                             
-                            for ticker in set(potential_tickers[:5]):
+                            for idx, ticker in enumerate(set(potential_tickers[:5])):
                                 try:
                                     with feedback_container:
                                         st.write(f"   Fetching {ticker}...")
                                     
+                                    # Add delay between requests to avoid rate limiting
+                                    if idx > 0:
+                                        time.sleep(1)
+                                    
                                     stock = yf.Ticker(ticker)
-                                    hist_intraday = stock.history(period='1d', interval='1m')
                                     hist_daily = stock.history(period='5d')
                                     
-                                    if not hist_intraday.empty:
-                                        current_price = hist_intraday['Close'].iloc[-1]
-                                        if len(hist_daily) >= 2:
-                                            prev_close = hist_daily['Close'].iloc[-2]
-                                            change_pct = ((current_price / prev_close) - 1) * 100
-                                        else:
-                                            prev_close = current_price
-                                            change_pct = 0
-                                        
-                                        info = stock.info
-                                        price_data[ticker] = {
-                                            'price': current_price,
-                                            'change': change_pct,
-                                            'name': info.get('longName', ticker),
-                                            'currency': info.get('currency', 'USD'),
-                                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
-                                        }
-                                        with feedback_container:
-                                            st.success(f"✅ Got LIVE price for {ticker}: ${current_price:.2f} (as of {datetime.now().strftime('%H:%M UTC')})")
-                                    elif not hist_daily.empty:
+                                    if not hist_daily.empty:
                                         current_price = hist_daily['Close'].iloc[-1]
                                         if len(hist_daily) >= 2:
                                             prev_price = hist_daily['Close'].iloc[-2]
@@ -565,21 +550,63 @@ def main_app():
                                             change_pct = 0
                                         
                                         info = stock.info
+                                        currency = info.get('currency', 'USD')
+                                        name = info.get('longName', ticker)
+                                        
+                                        # Ensure we're in USD for futures
+                                        if ticker in ['GC=F', 'SI=F', 'CL=F']:
+                                            currency = 'USD'
+                                            if ticker == 'GC=F':
+                                                name = 'Gold Futures'
+                                            elif ticker == 'SI=F':
+                                                name = 'Silver Futures'
+                                            elif ticker == 'CL=F':
+                                                name = 'Crude Oil Futures'
+                                        
                                         price_data[ticker] = {
                                             'price': current_price,
                                             'change': change_pct,
-                                            'name': info.get('longName', ticker),
-                                            'currency': info.get('currency', 'USD'),
+                                            'name': name,
+                                            'currency': currency,
                                             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
                                         }
+                                        
                                         with feedback_container:
-                                            st.success(f"✅ Got price for {ticker}: ${current_price:.2f}")
+                                            st.success(f"✅ Got {ticker} price: ${current_price:.2f} (as of {datetime.now().strftime('%H:%M UTC')})")
                                     else:
                                         with feedback_container:
                                             st.warning(f"⚠️ No data available for {ticker}")
                                 except Exception as e:
-                                    with feedback_container:
-                                        st.error(f"❌ Error fetching {ticker}: {str(e)}")
+                                    error_msg = str(e)
+                                    if 'rate' in error_msg.lower() or '429' in error_msg:
+                                        with feedback_container:
+                                            st.warning(f"⚠️ Rate limited for {ticker} - trying again after delay...")
+                                        time.sleep(2)  # Wait before retrying
+                                        try:
+                                            stock = yf.Ticker(ticker)
+                                            hist_daily = stock.history(period='5d')
+                                            if not hist_daily.empty:
+                                                current_price = hist_daily['Close'].iloc[-1]
+                                                if len(hist_daily) >= 2:
+                                                    prev_price = hist_daily['Close'].iloc[-2]
+                                                    change_pct = ((current_price / prev_price) - 1) * 100
+                                                else:
+                                                    change_pct = 0
+                                                price_data[ticker] = {
+                                                    'price': current_price,
+                                                    'change': change_pct,
+                                                    'name': f'{ticker} Futures',
+                                                    'currency': 'USD',
+                                                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+                                                }
+                                                with feedback_container:
+                                                    st.success(f"✅ Got {ticker} price (retry): ${current_price:.2f}")
+                                        except:
+                                            with feedback_container:
+                                                st.error(f"❌ Could not fetch {ticker} (rate limited - try again later)")
+                                    else:
+                                        with feedback_container:
+                                            st.error(f"❌ Error fetching {ticker}: {error_msg}")
                         else:
                             with feedback_container:
                                 st.warning("⚠️ No tickers detected in question")
@@ -643,6 +670,7 @@ def main_app():
                                                             'headline': headline,
                                                             'summary': article.get('description', '')[:200] if article.get('description') else '',
                                                             'datetime': article.get('pubDate', 'Recent'),
+                                                            'url': article.get('link', ''),
                                                             'query': query
                                                         })
                                                 with feedback_container:
@@ -695,7 +723,8 @@ def main_app():
                                                     'source': f'Finnhub - {ticker}',
                                                     'headline': article.get('headline', ''),
                                                     'summary': article.get('summary', '')[:200],
-                                                    'datetime': datetime.fromtimestamp(article.get('datetime', 0)).strftime('%Y-%m-%d %H:%M')
+                                                    'datetime': datetime.fromtimestamp(article.get('datetime', 0)).strftime('%Y-%m-%d %H:%M'),
+                                                    'url': article.get('url', '')
                                                 })
                                         else:
                                             with feedback_container:
@@ -733,6 +762,9 @@ def main_app():
                                         st.write(f"**Headline:** {news['headline']}")
                                         if news['summary']:
                                             st.write(f"**Summary:** {news['summary']}")
+                                        if news.get('url'):
+                                            st.markdown(f"[📖 Read Full Article]({news['url']})")
+                                        st.write(f"**Why it matters:** This article affects {news.get('query', 'market')} sentiment and price movement")
                             else:
                                 st.info("ℹ️ No articles found - analyzing based on price data only")
                         
