@@ -58,6 +58,7 @@ RESULTS_DIR = Path("results")
 CONFIG_DIR = Path("config")
 SCANNER_DIR = Path("scanner_results")
 SESSION_FILE = CONFIG_DIR / "session.json"
+ADMIN_DEVICE_FILE = CONFIG_DIR / ".admin_device"
 
 for dir_path in [LOG_DIR, RESULTS_DIR, CONFIG_DIR, SCANNER_DIR]:
     dir_path.mkdir(exist_ok=True)
@@ -8456,6 +8457,18 @@ class FinalAIQuantum:
     
     def _require_login(self) -> bool:
         """Check if users exist and require login."""
+        # Check if this is an admin device (bypass login)
+        if ADMIN_DEVICE_FILE.exists():
+            try:
+                with open(ADMIN_DEVICE_FILE, 'r') as f:
+                    admin_info = json.load(f)
+                admin_user = admin_info.get('username', 'admin')
+                self.current_user = admin_user
+                console.print(f"\n[green]✓ Admin device detected - Welcome, {admin_user}![/green]\n")
+                return False  # Continue to app without login
+            except Exception:
+                pass
+        
         users = UserManager.load_users()
 
         # Auto-login if a valid session exists
@@ -8728,9 +8741,11 @@ class FinalAIQuantum:
             console.print("3. 🔑 Change User Password")
             console.print("4. 🔄 Activate/Deactivate User")
             console.print("5. 🗑️  Delete User")
-            console.print("6. 🔙 Back to Main Menu\n")
+            console.print("6. �️  Mark as Admin Device (No Login Required)")
+            console.print("7. 🚫 Remove Admin Device Status")
+            console.print("8. 🔙 Back to Main Menu\n")
             
-            choice = Prompt.ask("Select", choices=["1", "2", "3", "4", "5", "6"], default="1")
+            choice = Prompt.ask("Select", choices=["1", "2", "3", "4", "5", "6", "7", "8"], default="1")
             
             if choice == "1":
                 console.print("\n[bold cyan]Create New User[/bold cyan]\n")
@@ -8811,6 +8826,51 @@ class FinalAIQuantum:
                 Prompt.ask("\nPress Enter to continue")
             
             elif choice == "6":
+                console.print("\n[bold cyan]🖥️  Mark as Admin Device[/bold cyan]\n")
+                console.print("[yellow]⚠ This will allow this device to bypass login permanently.[/yellow]")
+                console.print("[dim]Recommended only for your personal/trusted devices.[/dim]\n")
+                
+                if Confirm.ask("Mark this device as admin device?", default=False):
+                    username = Prompt.ask("Enter your admin username", default=self.current_user or "admin")
+                    try:
+                        with open(ADMIN_DEVICE_FILE, 'w') as f:
+                            json.dump({
+                                "username": username,
+                                "marked_at": datetime.now().isoformat(),
+                                "device_info": os.environ.get('COMPUTERNAME', 'Unknown')
+                            }, f, indent=2)
+                        console.print(f"\n[green]✓ This device is now marked as admin device![/green]")
+                        console.print(f"[green]Next time you start the app, login will be skipped.[/green]")
+                    except Exception as e:
+                        console.print(f"[red]❌ Failed to mark device: {e}[/red]")
+                
+                Prompt.ask("\nPress Enter to continue")
+            
+            elif choice == "7":
+                console.print("\n[bold cyan]🚫 Remove Admin Device Status[/bold cyan]\n")
+                
+                if ADMIN_DEVICE_FILE.exists():
+                    try:
+                        with open(ADMIN_DEVICE_FILE, 'r') as f:
+                            admin_info = json.load(f)
+                        console.print(f"[dim]Current admin device: {admin_info.get('username', 'Unknown')}[/dim]")
+                        console.print(f"[dim]Marked on: {admin_info.get('marked_at', 'Unknown')}[/dim]\n")
+                    except Exception:
+                        pass
+                    
+                    if Confirm.ask("Remove admin device status? (Login will be required next time)", default=False):
+                        try:
+                            ADMIN_DEVICE_FILE.unlink()
+                            console.print("\n[green]✓ Admin device status removed![/green]")
+                            console.print("[yellow]Login will be required next time you start the app.[/yellow]")
+                        except Exception as e:
+                            console.print(f"[red]❌ Failed to remove: {e}[/red]")
+                else:
+                    console.print("[yellow]This device is not marked as admin device.[/yellow]")
+                
+                Prompt.ask("\nPress Enter to continue")
+            
+            elif choice == "8":
                 break
 
     def _trade_conversation_advisor(self):
