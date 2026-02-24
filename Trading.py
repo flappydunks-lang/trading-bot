@@ -57,6 +57,7 @@ LOG_DIR = Path("logs")
 RESULTS_DIR = Path("results")
 CONFIG_DIR = Path("config")
 SCANNER_DIR = Path("scanner_results")
+SESSION_FILE = CONFIG_DIR / "session.json"
 
 for dir_path in [LOG_DIR, RESULTS_DIR, CONFIG_DIR, SCANNER_DIR]:
     dir_path.mkdir(exist_ok=True)
@@ -75,7 +76,6 @@ class _SafeConsoleFilter(logging.Filter):
             record.msg = safe
             record.args = ()
             return True
-
 file_handler = logging.FileHandler(LOG_DIR / f'finalai_{datetime.now().strftime("%Y%m%d")}.log', encoding='utf-8')
 stream_handler = logging.StreamHandler(sys.stdout)
 stream_handler.addFilter(_SafeConsoleFilter())
@@ -249,6 +249,9 @@ class UserManager:
             console.print(f"[red]✗ User '{username}' not found[/red]")
             return False
         
+        # Clear session before deleting
+        UserManager.clear_session(username)
+        
         del users[username]
         UserManager.save_users(users)
         console.print(f"[green]✓ User '{username}' deleted[/green]")
@@ -287,6 +290,20 @@ class UserManager:
         return user_list
     
     @staticmethod
+    def clear_session(username: str):
+        """Clear session for a specific user."""
+        try:
+            if SESSION_FILE.exists():
+                with open(SESSION_FILE, 'r') as f:
+                    session = json.load(f)
+                
+                if session.get('username') == username:
+                    SESSION_FILE.unlink()
+                    console.print(f"[yellow]Session cleared for '{username}'[/yellow]")
+        except Exception as e:
+            logger.debug(f"Session clear error: {e}")
+    
+    @staticmethod
     def toggle_user_status(username: str) -> bool:
         """Activate/deactivate a user."""
         users = UserManager.load_users()
@@ -297,6 +314,10 @@ class UserManager:
         
         users[username]["active"] = not users[username].get("active", True)
         UserManager.save_users(users)
+        
+        # Clear session when deactivating
+        if not users[username]["active"]:
+            UserManager.clear_session(username)
         
         status = "activated" if users[username]["active"] else "deactivated"
         console.print(f"[green]✓ User '{username}' {status}[/green]")
@@ -3153,23 +3174,89 @@ class NewsAnalyzer:
     
     @staticmethod
     def get_news(ticker: str, limit: int = 10) -> List[NewsItem]:
-        """Get real news headlines for a ticker - strict ticker verification on all sources."""
-        news_items = []
+        """Get news headlines from all sources for the last 7 days relevant to a ticker."""
+        news_items: List[NewsItem] = []
         try:
             import requests
+            from datetime import timezone
             
-            logger.info(f"📰 Fetching {ticker} headlines (strict ticker filtering)...")
+            logger.info(f"📰 Fetching {ticker} headlines from all sources (last 7 days)...")
             
             ticker_lower = ticker.lower()
             ticker_upper = ticker.upper()
+            now_utc = datetime.now(timezone.utc)
+            cutoff_utc = now_utc - timedelta(days=7)
             
-            def verify_ticker_in_title(title: str) -> bool:
-                """Strict check: title must contain ticker symbol."""
-                if not title:
+            # Try to resolve company name for more accurate relevance filtering
+            company_name = ""
+            try:
+                info = DataManager.get_ticker_info(ticker)
+                company_name = (info.get('name') or '').strip()
+            except Exception:
+                company_name = ""
+
+            def _clean_company_name(name: str) -> str:
+                if not name:
+                    return ""
+                # Remove common suffixes
+                suffixes = ["inc", "inc.", "corp", "corp.", "corporation", "ltd", "ltd.", "llc", "plc", "holdings", "holding", "group"]
+                parts = [p for p in re.split(r"\s+", name.lower()) if p]
+                parts = [p for p in parts if p not in suffixes]
+                return " ".join(parts).strip()
+
+            cleaned_company = _clean_company_name(company_name)
+            company_tokens = [t for t in re.split(r"\s+", cleaned_company) if t]
+            
+            def _parse_date(val: Any) -> Optional[datetime]:
+                """Parse a date from multiple API formats, returning UTC datetime if possible."""
+                if val is None:
+                    return None
+                try:
+                    if isinstance(val, (int, float)):
+                        return datetime.fromtimestamp(val, tz=timezone.utc)
+                    if isinstance(val, str):
+                        v = val.strip()
+                        if not v:
+                            return None
+                        # ISO-like with Z
+                        if "T" in v:
+                            try:
+                                return datetime.fromisoformat(v.replace("Z", "+00:00"))
+                            except Exception:
+                                pass
+                        # AlphaVantage format: YYYYMMDDTHHMMSS
+                        if len(v) >= 15 and v[8] == 'T' and v[:8].isdigit():
+                            try:
+                                return datetime.strptime(v[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+                            except Exception:
+                                pass
+                        # Fallback common format
+                        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%a, %d %b %Y %H:%M:%S %Z"):
+                            try:
+                                return datetime.strptime(v, fmt).replace(tzinfo=timezone.utc)
+                            except Exception:
+                                continue
+                except Exception:
+                    return None
+                return None
+
+            def _is_relevant(title: str, description: str = "") -> bool:
+                """Loose relevance check: ticker or company name in title/description."""
+                if not title and not description:
                     return False
-                title_lower = title.lower()
-                # Accept if ticker appears in title (case-insensitive)
-                return ticker_lower in title_lower or ticker_upper in title
+                blob = f"{title} {description}".lower()
+                if ticker_lower in blob:
+                    return True
+                # Match company tokens (at least two tokens or one long token)
+                if company_tokens:
+                    hits = sum(1 for t in company_tokens if len(t) >= 3 and t in blob)
+                    if hits >= 2:
+                        return True
+                    if len(company_tokens) == 1 and hits == 1 and len(company_tokens[0]) >= 4:
+                        return True
+                    if hits == 1 and len(company_tokens[0]) >= 6:
+                        return True
+                return False
             
             def calculate_sentiment(title: str) -> str:
                 """Calculate sentiment from headline words."""
@@ -3193,34 +3280,34 @@ class NewsAnalyzer:
                             logger.debug(f"Polygon returned {len(data.get('results', []))} results")
                             for item in data['results'][:limit*3]:
                                 title = item.get('title', '') or item.get('headline', '')
-                                
-                                # STRICT: Only accept if ticker is in headline
-                                if not title or len(title) < 15:
+                                description = item.get('description', '') or item.get('summary', '')
+                                published_dt = _parse_date(item.get('published_utc') or item.get('published_at'))
+                                if published_dt and published_dt < cutoff_utc:
                                     continue
-                                if not verify_ticker_in_title(title):
-                                    logger.debug(f"Rejected (no ticker): {title[:50]}")
+                                
+                                # Relevance filter: ticker or company name
+                                if not title or len(title) < 12:
+                                    continue
+                                if not _is_relevant(title, description):
+                                    logger.debug(f"Rejected (irrelevant): {title[:50]}")
                                     continue
                                     
                                 url_str = item.get('article_url', f"https://finance.yahoo.com/quote/{ticker}")
                                 
                                 # Sentiment
                                 sentiment = calculate_sentiment(title)
+                                published_str = published_dt.strftime("%Y-%m-%d %H:%M UTC") if published_dt else "Recent"
                                 
                                 news_items.append(NewsItem(
                                     title=title,
                                     source=item.get('publisher', {}).get('name', 'Polygon') if isinstance(item.get('publisher'), dict) else 'Polygon',
-                                    published="Today",
+                                    published=published_str,
                                     url=url_str,
                                     sentiment=sentiment,
                                     relevance=0.98,
                                     score=0.0
                                 ))
-                            
-                            if len(news_items) > 0:
-                                logger.info(f"✓ Found {len(news_items)} {ticker}-specific headlines via Polygon.io")
-                                return news_items[:limit]
-                            else:
-                                logger.debug(f"Polygon: No {ticker}-specific headlines after filtering")
+                            logger.info(f"✓ Polygon.io: {len(news_items)} items after filtering")
             except Exception as e:
                 logger.debug(f"Polygon.io API failed: {e}")
             
@@ -3236,32 +3323,32 @@ class NewsAnalyzer:
                             logger.debug(f"Finnhub returned {len(items)} results")
                             for item in items[:limit*3]:
                                 title = item.get('headline', '')
-                                
-                                # STRICT: Only accept if ticker is in headline
-                                if not title or len(title) < 15:
+                                description = item.get('summary', '') or item.get('description', '')
+                                published_dt = _parse_date(item.get('datetime'))
+                                if published_dt and published_dt < cutoff_utc:
                                     continue
-                                if not verify_ticker_in_title(title):
-                                    logger.debug(f"Rejected (no ticker): {title[:50]}")
+                                
+                                # Relevance filter
+                                if not title or len(title) < 12:
+                                    continue
+                                if not _is_relevant(title, description):
+                                    logger.debug(f"Rejected (irrelevant): {title[:50]}")
                                     continue
                                 
                                 url_str = item.get('url', f"https://finance.yahoo.com/quote/{ticker}")
                                 sentiment = calculate_sentiment(title)
+                                published_str = published_dt.strftime("%Y-%m-%d %H:%M UTC") if published_dt else "Recent"
                                 
                                 news_items.append(NewsItem(
                                     title=title,
                                     source=item.get('source', 'Finnhub'),
-                                    published="Today",
+                                    published=published_str,
                                     url=url_str,
                                     sentiment=sentiment,
                                     relevance=0.95,
                                     score=0.0
                                 ))
-                            
-                            if len(news_items) > 0:
-                                logger.info(f"✓ Found {len(news_items)} {ticker}-specific headlines via Finnhub")
-                                return news_items[:limit]
-                            else:
-                                logger.debug(f"Finnhub: No {ticker}-specific headlines after filtering")
+                            logger.info(f"✓ Finnhub: {len(news_items)} items after filtering")
             except Exception as e:
                 logger.debug(f"Finnhub API failed: {e}")
             
@@ -3278,35 +3365,83 @@ class NewsAnalyzer:
                             logger.debug(f"AlphaVantage returned {len(items)} results")
                             for item in items[:limit*3]:
                                 title = item.get('title', '')
-                                
-                                # STRICT: Only accept if ticker is in headline
-                                if not title or len(title) < 15:
+                                description = item.get('summary', '') or item.get('description', '')
+                                published_dt = _parse_date(item.get('time_published'))
+                                if published_dt and published_dt < cutoff_utc:
                                     continue
-                                if not verify_ticker_in_title(title):
-                                    logger.debug(f"Rejected (no ticker): {title[:50]}")
+                                
+                                # Relevance filter
+                                if not title or len(title) < 12:
+                                    continue
+                                if not _is_relevant(title, description):
+                                    logger.debug(f"Rejected (irrelevant): {title[:50]}")
                                     continue
                                 
                                 url_str = item.get('url', f"https://finance.yahoo.com/quote/{ticker}")
                                 sentiment = item.get('overall_sentiment_label', 'NEUTRAL')
+                                published_str = published_dt.strftime("%Y-%m-%d %H:%M UTC") if published_dt else "Recent"
                                 
                                 news_items.append(NewsItem(
                                     title=title,
                                     source=item.get('source', 'AlphaVantage'),
-                                    published="Today",
+                                    published=published_str,
                                     url=url_str,
                                     sentiment=sentiment,
                                     relevance=0.90,
                                     score=0.0
                                 ))
-                            if len(news_items) > 0:
-                                logger.info(f"✓ Found {len(news_items)} {ticker}-specific headlines via AlphaVantage")
-                                return news_items[:limit]
-                            else:
-                                logger.debug(f"AlphaVantage: No {ticker}-specific headlines after filtering")
+                            logger.info(f"✓ AlphaVantage: {len(news_items)} items after filtering")
             except Exception as e:
                 logger.debug(f"AlphaVantage API failed: {e}")
+
+            # Method 4: NewsData.io (general) - filter by relevance and recency
+            try:
+                nd_key = os.getenv('NEWSDATA_API_KEY')
+                if nd_key:
+                    url = "https://newsdata.io/api/1/news"
+                    q_terms = [ticker_upper]
+                    if cleaned_company:
+                        q_terms.append(f'"{cleaned_company}"')
+                    params = {
+                        'q': " OR ".join(q_terms),
+                        'apikey': nd_key,
+                        'language': 'en',
+                        'sort': 'recent',
+                        'limit': min(limit * 4, 50)
+                    }
+                    response = requests.get(url, params=params, timeout=10)
+                    if response.status_code == 200:
+                        data = response.json()
+                        items = data.get('results', [])
+                        if items:
+                            logger.debug(f"NewsData returned {len(items)} results")
+                            for item in items[:limit*3]:
+                                title = item.get('title', '')
+                                description = item.get('description', '')
+                                published_dt = _parse_date(item.get('pubDate'))
+                                if published_dt and published_dt < cutoff_utc:
+                                    continue
+                                if not title or len(title) < 12:
+                                    continue
+                                if not _is_relevant(title, description):
+                                    continue
+                                url_str = item.get('link', f"https://finance.yahoo.com/quote/{ticker}")
+                                sentiment = calculate_sentiment(title)
+                                published_str = published_dt.strftime("%Y-%m-%d %H:%M UTC") if published_dt else "Recent"
+                                news_items.append(NewsItem(
+                                    title=title,
+                                    source=item.get('source_id', 'NewsData'),
+                                    published=published_str,
+                                    url=url_str,
+                                    sentiment=sentiment,
+                                    relevance=0.85,
+                                    score=0.0
+                                ))
+                            logger.info(f"✓ NewsData.io: {len(news_items)} items after filtering")
+            except Exception as e:
+                logger.debug(f"NewsData.io API failed: {e}")
             
-            # Method 4: Yahoo Finance HTML - LAST RESORT
+            # Method 5: Yahoo Finance HTML - LAST RESORT
             try:
                 from bs4 import BeautifulSoup
                 
@@ -3337,8 +3472,8 @@ class NewsAnalyzer:
                         if not title or len(title) < 25 or len(title) > 300:
                             continue
                         
-                        # STRICT: Must contain ticker
-                        if not verify_ticker_in_title(title):
+                        # Relevance filter
+                        if not _is_relevant(title, ""):
                             continue
                         
                         # Skip nav elements
@@ -3363,7 +3498,7 @@ class NewsAnalyzer:
                         news_items.append(NewsItem(
                             title=title,
                             source="Yahoo Finance",
-                            published="Today",
+                            published="Recent",
                             url=href if href and href.startswith('http') else f"https://finance.yahoo.com/quote/{ticker}",
                             sentiment=sentiment,
                             relevance=0.85,
@@ -3371,14 +3506,30 @@ class NewsAnalyzer:
                         ))
                     
                     if len(news_items) > 0:
-                        logger.info(f"✓ Found {len(news_items)} {ticker}-specific headlines via Yahoo Finance")
-                        return news_items[:limit]
+                        logger.info(f"✓ Yahoo Finance: {len(news_items)} items after filtering")
                     else:
                         logger.debug(f"Yahoo Finance: No {ticker}-specific headlines after filtering")
                         
             except Exception as e:
                 logger.debug(f"Yahoo Finance HTML parsing failed: {e}")
             
+            # Deduplicate by URL/title and sort by recency when possible
+            deduped: List[NewsItem] = []
+            seen = set()
+            for item in news_items:
+                key = (item.url or "", item.title or "")
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(item)
+
+            def _sort_key(it: NewsItem):
+                dt = _parse_date(it.published)
+                return dt or datetime.min.replace(tzinfo=timezone.utc)
+
+            deduped.sort(key=_sort_key, reverse=True)
+            news_items = deduped
+
             # Final fallback - show search link
             if len(news_items) == 0:
                 logger.warning(f"⚠ No real headlines found for {ticker} - check your API keys or ticker symbol")
@@ -3431,7 +3582,15 @@ class FinnhubAnalyzer:
         """Get Finnhub API key from environment."""
         key = os.getenv('FINNHUB_API_KEY', '')
         if not key:
-            logger.debug("Finnhub API key not set. Set FINNHUB_API_KEY environment variable.")
+            try:
+                config = ConfigurationManager.load_config()
+                key = (config or {}).get('finnhub_api_key', '')
+                if key:
+                    os.environ['FINNHUB_API_KEY'] = key
+            except Exception:
+                key = ''
+        if not key:
+            logger.debug("Finnhub API key not set. Set FINNHUB_API_KEY environment variable or config/config.json.")
         return key
     
     @staticmethod
@@ -3811,7 +3970,15 @@ class NewsDataAnalyzer:
         """Get NewsData.IO API key from environment."""
         key = os.getenv('NEWSDATA_API_KEY', '')
         if not key:
-            logger.debug("NewsData.IO API key not set. Set NEWSDATA_API_KEY environment variable.")
+            try:
+                config = ConfigurationManager.load_config()
+                key = (config or {}).get('newsdata_api_key', '')
+                if key:
+                    os.environ['NEWSDATA_API_KEY'] = key
+            except Exception:
+                key = ''
+        if not key:
+            logger.debug("NewsData.IO API key not set. Set NEWSDATA_API_KEY environment variable or config/config.json.")
         return key
     
     @staticmethod
@@ -8207,13 +8374,27 @@ class FinalAIQuantum:
                 title="[bold]API Setup Required[/bold]"
             )
             console.print(setup_panel)
-            
-            if Confirm.ask("\n[cyan]Would you like to set up these API keys now?[/cyan]", default=True):
-                self._setup_api_keys_interactive(missing_keys)
-            else:
-                console.print("\n[yellow]⚠ Warning: Trading bot and advisor features require API keys.[/yellow]")
-                console.print("[dim]You can set them up later in Settings (Option 17)[/dim]\n")
-                Prompt.ask("Press Enter to continue")
+
+            # Always prompt for missing keys so the user can enter them immediately
+            self._setup_api_keys_interactive(missing_keys)
+    
+    def _load_api_keys_from_config(self):
+        """Load saved API keys from config into environment variables."""
+        if not self.config:
+            return
+        
+        # Load each API key from config to environment if not already set
+        if self.config.get('finnhub_api_key') and not os.getenv('FINNHUB_API_KEY'):
+            os.environ['FINNHUB_API_KEY'] = self.config['finnhub_api_key']
+        
+        if self.config.get('newsdata_api_key') and not os.getenv('NEWSDATA_API_KEY'):
+            os.environ['NEWSDATA_API_KEY'] = self.config['newsdata_api_key']
+        
+        if self.config.get('groq_api_key') and not os.getenv('GROQ_API_KEY'):
+            os.environ['GROQ_API_KEY'] = self.config['groq_api_key']
+        
+        if self.config.get('anthropic_api_key') and not os.getenv('ANTHROPIC_API_KEY'):
+            os.environ['ANTHROPIC_API_KEY'] = self.config['anthropic_api_key']
     
     def _setup_api_keys_interactive(self, keys_to_setup: list):
         """Interactive setup for API keys."""
@@ -8276,6 +8457,19 @@ class FinalAIQuantum:
     def _require_login(self) -> bool:
         """Check if users exist and require login."""
         users = UserManager.load_users()
+
+        # Auto-login if a valid session exists
+        if SESSION_FILE.exists():
+            try:
+                with open(SESSION_FILE, 'r') as f:
+                    session = json.load(f)
+                session_user = session.get('username')
+                if session_user and session_user in users and users[session_user].get("active", True):
+                    self.current_user = session_user
+                    console.print(f"\n[green]✓ Welcome back, {session_user}![/green]\n")
+                    return False  # Continue to app
+            except Exception:
+                pass
         
         # If no users exist, create first admin account
         if not users:
@@ -8306,6 +8500,14 @@ class FinalAIQuantum:
             
             if UserManager.authenticate(username, password):
                 self.current_user = username
+                try:
+                    with open(SESSION_FILE, 'w') as f:
+                        json.dump({
+                            "username": username,
+                            "login_at": datetime.now().isoformat()
+                        }, f, indent=2)
+                except Exception:
+                    pass
                 console.print(f"\n[green]✓ Welcome, {username}![/green]\n")
                 time.sleep(1)
                 return False  # Continue to app
@@ -8321,9 +8523,9 @@ class FinalAIQuantum:
     
     def initialize(self):
         """Initialize application with all checks."""
-        # Skip login for local machine - only required for web interface
-        # if self._require_login():
-        #     return  # Exit if login fails
+        # Require login - session persists until account is deleted/deactivated
+        if self._require_login():
+            return  # Exit if login fails
         
         DisplayManager.show_header()
         
@@ -8344,6 +8546,9 @@ class FinalAIQuantum:
                 'anthropic_api_key': ''
             }
             ConfigurationManager.save_config(self.config)
+        
+        # Load saved API keys from config into environment variables
+        self._load_api_keys_from_config()
         
         # Check and prompt for missing API keys
         self._validate_and_setup_api_keys()
@@ -8609,31 +8814,34 @@ class FinalAIQuantum:
                 break
 
     def _trade_conversation_advisor(self):
-        """Interactive AI trade advisor - DuckDuckGo search + Groq analysis."""
+        """Interactive AI trade advisor."""
         DisplayManager.show_header()
-        
-        console.print("[bold cyan]💬 AI Trade Advisor (DuckDuckGo + Groq)[/bold cyan]\n")
-        console.print("[dim]Chat naturally about your trades, stocks, or market ideas.[/dim]")
-        console.print("[dim]I'll search DuckDuckGo for news and Groq will analyze it.[/dim]")
-        console.print("[dim]Type 'exit' or 'quit' to return to the main menu.\n[/dim]")
-        
-        # Setup Groq
-        groq_key = self.config.get('groq_api_key', '')
-        
+
+        # Ensure required API keys are set before starting
+        self._validate_and_setup_api_keys()
+
+        # Re-check and prompt for any missing keys (Finnhub, NewsData.IO, Groq)
+        missing_keys = []
+        finnhub_key = os.getenv('FINNHUB_API_KEY') or (self.config or {}).get('finnhub_api_key', '')
+        newsdata_key = os.getenv('NEWSDATA_API_KEY') or (self.config or {}).get('newsdata_api_key', '')
+        groq_key = os.getenv('GROQ_API_KEY') or (self.config or {}).get('groq_api_key', '')
+
+        if not finnhub_key or not finnhub_key.strip():
+            missing_keys.append('Finnhub')
+        if not newsdata_key or not newsdata_key.strip():
+            missing_keys.append('NewsData.IO')
         if not groq_key or not groq_key.strip():
-            console.print("\n[cyan]🚀 Quick Groq Setup[/cyan]\n")
-            console.print("1. Go to: [cyan]https://console.groq.com/keys[/cyan]")
-            console.print("2. Sign up (free) → Create API key")
-            console.print("3. Paste here\n")
-            
-            if Confirm.ask("Ready?", default=True):
-                groq_key = Prompt.ask("Enter your Groq API key")
-                self.config['groq_api_key'] = groq_key
-                ConfigurationManager.save_config(self.config)
-                console.print("[green]✓ Saved![/green]\n")
-            else:
-                Prompt.ask("\nPress Enter to continue")
-                return
+            missing_keys.append('Groq')
+
+        if missing_keys:
+            self._setup_api_keys_interactive(missing_keys)
+
+            finnhub_key = os.getenv('FINNHUB_API_KEY') or (self.config or {}).get('finnhub_api_key', '')
+            newsdata_key = os.getenv('NEWSDATA_API_KEY') or (self.config or {}).get('newsdata_api_key', '')
+            groq_key = os.getenv('GROQ_API_KEY') or (self.config or {}).get('groq_api_key', '')
+
+            if not finnhub_key or not finnhub_key.strip() or not newsdata_key or not newsdata_key.strip() or not groq_key or not groq_key.strip():
+                console.print("[yellow]⚠ Missing one or more required API keys. Advisor will run with limited functionality.[/yellow]")
         
         try:
             from openai import OpenAI
@@ -8642,6 +8850,8 @@ class FinalAIQuantum:
                 base_url="https://api.groq.com/openai/v1"
             )
             console.print("[green]✓ Groq connected!\n[/green]")
+            use_groq = True
+            use_ollama = False
         except ImportError:
             console.print("[yellow]Installing openai...[/yellow]")
             import subprocess
@@ -8652,6 +8862,8 @@ class FinalAIQuantum:
                 base_url="https://api.groq.com/openai/v1"
             )
             console.print("[green]✓ Connected!\n[/green]")
+            use_groq = True
+            use_ollama = False
         except Exception as e:
             console.print(f"[red]❌ Groq connection failed: {e}[/red]")
             Prompt.ask("\nPress Enter to continue")
@@ -8660,66 +8872,58 @@ class FinalAIQuantum:
         # Conversation history
         conversation_history = []
         technical_analyzer = TechnicalAnalyzer()
+        last_trade_summary: Optional[TradeSummary] = None
         
         # More conversational system prompt
-        system_prompt = """You are a professional trader chatting naturally about stocks. Sound like a real person talking to a friend.
+        current_date = datetime.now().strftime("%A, %B %d, %Y")
+        system_prompt = f"""You are a professional AI trading assistant. Current date: {current_date}
 
-DATA SOURCES AVAILABLE:
-- Finnhub: Real-time company news, earnings, analyst ratings, insider trades
-- SEC Edgar: Official filings (10-K, 10-Q, 8-K), insider trading data
-- NewsData.IO: Geopolitical events, macro news, Fed decisions, trade wars, sanctions, OPEC actions - market-moving global events
-- Technical Analysis: Price action, support/resistance, trend data
-- News: Web search results and market news
+You can handle both general questions AND market analysis.
 
-Your style:
-- Keep it short and conversational (1-3 sentences unless they ask for details)
-- Sound natural - use contractions, casual language
-- Share what you see without being robotic
-- ALWAYS mention your source when you cite a fact (Finnhub, SEC, NewsData, News, etc)
-- ALWAYS provide DIRECT article/filing links when referencing specific sources
-- Ask or engage naturally, don't just dump a verdict
+WHEN USER ASKS GENERAL QUESTIONS (e.g., "what day is it", "who is president", "how are you"):
+- Answer them directly and helpfully
+- Be conversational and friendly
+- No need to force market analysis
+- Example: "what day is it" → "Today is {current_date}"
+- Example: "who is president" → "As of February 2026, I don't have real-time political data, but you're asking a general question - I'm here primarily for trading analysis"
 
-CRITICAL DATA ACCURACY RULES:
-- ONLY cite specific numbers (%, price moves, etc) if they appear EXACTLY in the articles/filings provided
-- For SEC filings: reference the form type (10-K, 8-K) and filing date
-- For insider trades: mention the insider name, position, and transaction type from SEC data
-- For Finnhub data: cite the source clearly
-- For geopolitical events (NewsData.IO): explain the economic impact chain clearly
-- If the data doesn't have exact numbers, say "based on recent reports" or "according to reports" instead of guessing
+WHEN USER ASKS ABOUT MARKETS/STOCKS (e.g., "why is AAPL down", "analyze TSLA", "what's happening with gold"):
 
-GEOPOLITICAL & MACRO EVENTS (NewsData.IO) - CRITICAL FEATURE:
-When you see geopolitical or macro events in the news:
-1. Identify the event: "Fed raised rates", "China imposed tariffs", "OPEC cut production", "Russia/Ukraine conflict", etc.
-2. Explain DIRECT market impact:
-   - Fed rate hikes → Banks rally (higher interest margins), Bonds fall, Growth stocks pressured
-   - Fed rate cuts → Gold rallies (lower opportunity cost), Bonds rally, Growth stocks rally, REITs rally
-   - Tariffs/Trade wars → Export companies hurt, domestic competitors helped, consumer prices up
-   - OPEC production cuts → Oil prices up, Energy stocks rally (XOM/CVX), Airlines/Logistics hurt (higher fuel)
-   - Geopolitical conflict → Energy supply concerns (oil up), Defense contractors rally, Uncertainty sells off growth
-   - Strong USD → American exporters struggle, foreign investors buy US assets (attracts capital)
-   - Weak USD → Commodities rally, Energy up, International companies' US earnings boosted
-3. Link affected stocks to the event: "This helps [bullish sectors] but hurts [bearish sectors]"
-4. Cite NewsData.IO article link
+CRITICAL RESPONSE STRUCTURE - YOU MUST FOLLOW THIS:
 
-Examples:
-- "Fed hiked rates again (NewsData.IO). Banks like JPM and BAC love this - higher rates = fatter profit margins on loans. But growth stocks like NVDA and TSLA get hit because future earnings are worth less. Here's the article: [link]"
-- "China just slapped tariffs on US semiconductors (NewsData.IO). That's bearish for TSMC, SMIC, and chips heading to China. But Intel and AMD could benefit if those orders shift domestically. Full story: [link]"
-- "OPEC announced production cut (NewsData.IO). Oil prices jumped - great for Exxon (XOM) and Chevron (CVX), but hurts airlines (UAL, DAL) and shipping (FDX) who pay more for fuel. Check this: [link]"
+**PARAGRAPH 1: THE CATALYST & WHY IT MATTERS**
+- State the specific news event or catalyst (with article title + link if applicable)
+- Explain the DIRECT CAUSAL MECHANISM: WHY does this specific event affect THIS stock?
+- Include numbers from the news (revenue impact, percentage change, analyst targets, etc.)
+- Example: "Apple announced iPhone sales dropped 15% in China (source: [Article Title](link)). This matters for AAPL because China represents 20% of their total revenue - a 15% drop there means roughly 3% hit to total earnings, which is why the stock sold off 4.2% today."
 
-WHEN USER ASKS "WHY IS [TICKER] GOING UP/DOWN?":
-Look for:
-1. Company-specific news (Finnhub, SEC filings)
-2. Geopolitical/macro events (NewsData.IO) affecting the sector
-3. Technical breakdown or rally
-4. Connect all three to give a complete answer
+**PARAGRAPH 2: TECHNICAL & MARKET STRUCTURE** 
+- Add technical context: RSI levels, support/resistance, trend status
+- Explain what the CHART is telling us about how traders are reacting
+- Connect technical setup to the fundamental story
+- Example: "Technically, AAPL is now oversold (RSI at 28) and approaching the 200-day MA support at $165. This level has held 3 times in the past year, so we're likely to see short-term bounce attempts here."
 
-Rules:
-- If you mention a number from news = MUST include source article link
-- NO generic links - only specific articles about the topic
-- Sound like you're thinking, not reading a script
-- EXPLAIN the WHY using news provided, not guesses
-- The news context contains answers - use it directly to explain movements
-- Geopolitical events are important market drivers - don't ignore them
+**PARAGRAPH 3: WHAT HAPPENS NEXT (YOUR FORWARD-LOOKING OPINION)**
+- Give your PREDICTION for the next few days/weeks
+- State the CONDITIONS that would confirm your thesis
+- Include price targets or key levels to watch
+- Be DECISIVE - say "I expect" or "Most likely" not "could maybe possibly"
+- Example: "**What's next:** I expect a short-term bounce to $170-172 over the next 3-5 days as oversold conditions unwind, BUT the longer-term downtrend remains intact until we see China sales stabilize. Key level to watch: if we break below $165, next stop is $155. If we reclaim $175, the selling pressure has exhausted."
+
+MANDATORY RULES:
+1. NEVER ask questions or offer to do things
+2. ALWAYS explain WHY the news affects THIS specific stock (the mechanism)
+3. ALWAYS include forward-looking prediction with price levels
+4. Use specific numbers from the data provided
+5. Cite article titles and links when mentioning news
+6. Be confident and decisive in your outlook
+7. If missing data: "I don't have detailed data on that yet"
+
+EXAMPLES OF CORRECT RESPONSES:
+✅ "Fed hiked rates 0.5% (higher than expected 0.25%), which makes bonds yield 5.2% risk-free. Gold pays no yield, so investors are rotating out of GLD into treasuries - that's why gold dropped 3% today. Technically, we're still above the 200-day MA at $180, so pullback to $185 is likely buyable. **Next move:** Short-term consolidation around $185-190, then retest $195 if inflation data softens next week."
+
+❌ "The market experienced a decline due to concerns. What do you think?" (WRONG - vague, no mechanism, asking questions)
+❌ "Gold is trading sideways." (WRONG - no data, no prediction)
 """
         
         def extract_ticker_with_ai(msg: str) -> Optional[str]:
@@ -8771,6 +8975,249 @@ Respond with ONLY the 1-5 letter ticker symbol or "UNKNOWN". No explanations."""
         
         # Store news items for potential sending to phone
         stored_news = []
+        last_mentioned_ticker: Optional[str] = None
+
+        def build_news_context_from_stored(label: str) -> str:
+            """Build a concise news context block from stored_news."""
+            if not stored_news:
+                return ""
+            lines = [f"\n[NEWS CONTEXT - {label}]:"]
+            for i, item in enumerate(stored_news[:12], 1):
+                title = item.get('title', 'Unknown')
+                source = item.get('source', 'News')
+                url = item.get('url', '')
+                sentiment = item.get('sentiment', 'NEUTRAL')
+                lines.append(f"{i}. {title} | {source} | {sentiment} | {url}")
+            return "\n".join(lines)
+
+        def build_event_paragraphs(ticker: str, news_items: List[Dict[str, str]]) -> str:
+            """Create paragraph-style, event-specific reasoning from recent headlines."""
+            if not news_items:
+                return ""
+
+            def score(it):
+                title = (it.get('title') or "").lower()
+                source = (it.get('source') or "").lower()
+                url = (it.get('url') or "").lower()
+                bad = any(b in url for b in ["health.", "lifestyle", "travel", "food", "sports"]) or any(
+                    b in source for b in ["health", "lifestyle", "sports", "recipes"]
+                )
+                if bad:
+                    return -5
+                event_keywords = [
+                    "rate", "rates", "inflation", "fed", "fomc", "jobs", "cpi", "ppi",
+                    "earnings", "guidance", "forecast", "downgrade", "upgrade", "lawsuit",
+                    "antitrust", "sanctions", "tariffs", "deal", "acquisition", "merger",
+                    "contract", "award", "budget", "shutdown", "security", "breach",
+                    "cyberattack", "regulation", "policy", "election", "war", "conflict",
+                    "export controls", "supply chain", "outage", "opec", "tech", "ai",
+                    "software", "cloud", "semiconductor", "nasdaq"
+                ]
+                return sum(1 for k in event_keywords if k in title)
+
+            ranked = sorted(news_items, key=score, reverse=True)
+            top_items = [it for it in ranked if score(it) > 0 and it.get('url')][:3]
+            if not top_items:
+                return ""
+
+            paragraphs = []
+            for it in top_items:
+                title = it.get('title', 'Recent event')
+                link = it.get('url', '')
+                headline_l = title.lower()
+                if any(k in headline_l for k in ["rates", "rate hike", "inflation", "fed", "yield", "fomc", "cpi", "ppi"]):
+                    mechanism = f"Higher-rate expectations raise discount rates, which compresses valuation multiples and can weigh on {ticker.upper()} even without company-specific news."
+                elif any(k in headline_l for k in ["recession", "slowdown", "economy", "jobs", "growth fears"]):
+                    mechanism = f"Macro slowdown fears reduce risk appetite, leading investors to cut exposure to higher-beta names like {ticker.upper()}."
+                elif any(k in headline_l for k in ["nasdaq", "tech", "software", "ai", "semiconductor", "cloud"]):
+                    mechanism = f"Sector-wide selling spills into correlated tech/AI names, pulling {ticker.upper()} down with peers even if it wasn’t named directly."
+                elif any(k in headline_l for k in ["war", "conflict", "sanctions", "tariffs", "export controls", "geopolitical"]):
+                    mechanism = "Geopolitical stress raises risk premiums, often pressuring growth stocks as investors rotate to defensives."
+                elif any(k in headline_l for k in ["budget", "government", "contract", "shutdown", "defense"]):
+                    mechanism = f"Government spending uncertainty can affect contractors and adjacent tech vendors, which can influence sentiment toward {ticker.upper()}."
+                elif any(k in headline_l for k in ["cyberattack", "security", "breach", "outage"]):
+                    mechanism = "Security or outage headlines can shift sentiment toward software providers and risk perceptions across the sector."
+                else:
+                    # If no explicit event keyword, skip to avoid generic claims
+                    continue
+
+                paragraphs.append(f"{title} ({link}). {mechanism}")
+
+            if paragraphs:
+                # Add forward-looking conclusion
+                conclusion = "\n\n**What's next:** The stock is reacting to macro/sector pressures rather than company-specific news. Short-term volatility likely continues until either: (1) a company-specific catalyst emerges, or (2) the broader macro picture stabilizes. Watch key technical levels for breakout/breakdown signals."
+                return "\n\n".join(paragraphs) + conclusion
+            
+            return "\n\n".join(paragraphs)
+
+        def build_fallback_reasoning(ticker: str, tech_context: str, news_items: List[Dict[str, str]]) -> str:
+            """Create a structured, evidence-backed response when AI output is non-specific."""
+            summary_parts = []
+            reasons = []
+
+            # Parse technical signals
+            rsi_val = None
+            daily_trend = None
+            weekly_trend = None
+            support = None
+            resistance = None
+
+            for line in (tech_context or "").splitlines():
+                if "RSI:" in line:
+                    try:
+                        rsi_val = float(line.split("RSI:")[-1].strip())
+                    except Exception:
+                        pass
+                if "Daily Trend:" in line:
+                    daily_trend = line.split("Daily Trend:")[-1].strip()
+                if "Weekly Trend:" in line:
+                    weekly_trend = line.split("Weekly Trend:")[-1].strip()
+                if "Support:" in line:
+                    support = line.split("Support:")[-1].strip()
+                if "Resistance:" in line:
+                    resistance = line.split("Resistance:")[-1].strip()
+
+            if daily_trend or weekly_trend:
+                summary_parts.append(f"{ticker} is trending {daily_trend or weekly_trend}.".strip())
+            if rsi_val is not None:
+                summary_parts.append(f"RSI is {rsi_val:.1f}, signaling {'oversold' if rsi_val < 30 else 'overbought' if rsi_val > 70 else 'neutral'} momentum.")
+
+            if not summary_parts:
+                summary_parts.append(f"{ticker} is showing weakness with limited confirmed catalysts.")
+
+            # Reason 1: Use all headlines to infer macro/political impact (even if ticker not mentioned)
+            event_keywords = [
+                "rate", "rates", "inflation", "fed", "fomc", "jobs", "cpi", "ppi",
+                "earnings", "guidance", "forecast", "downgrade", "upgrade", "lawsuit",
+                "antitrust", "sanctions", "tariffs", "deal", "acquisition", "merger",
+                "contract", "award", "budget", "shutdown", "security", "breach",
+                "cyberattack", "regulation", "policy", "election", "war", "conflict",
+                "export controls", "supply chain", "outage", "opec"
+            ]
+
+            def _headline_score(it):
+                title = (it.get('title') or "").lower()
+                source = (it.get('source') or "").lower()
+                url = (it.get('url') or "").lower()
+                score = 0
+                if any(ev in title for ev in event_keywords):
+                    score += 4
+                # De-prioritize lifestyle/health sources
+                if any(bad in url for bad in ["health.", "lifestyle", "travel", "food", "sports"]):
+                    score -= 5
+                if any(bad in source for bad in ["health", "lifestyle", "sports", "recipes"]):
+                    score -= 5
+                return score
+
+            ranked = sorted(news_items, key=_headline_score, reverse=True) if news_items else []
+            picked_items = [it for it in ranked if _headline_score(it) >= 2][:2]
+
+            if picked_items:
+                for idx, picked in enumerate(picked_items, 1):
+                    headline = picked.get('title', 'Recent macro/sector headline')
+                    url = picked.get('url', '')
+                    src = picked.get('source', 'News')
+                    src_txt = f"Source: {src} {url}".strip()
+                    headline_l = headline.lower()
+                    mechanism = "Risk-off flows into defensives reduce demand for higher-multiple growth names like " + ticker.upper() + "."
+                    if any(k in headline_l for k in ["rates", "rate hike", "inflation", "fed", "yield", "fomc"]):
+                        mechanism = "Higher-rate expectations compress valuations for long-duration growth stocks, pressuring names like " + ticker.upper() + "."
+                    elif any(k in headline_l for k in ["recession", "slowdown", "economy", "growth fears", "jobs", "cpi", "ppi"]):
+                        mechanism = "Macro slowdown or hot inflation fears drive de-risking, pulling capital from growth/AI names into safer assets."
+                    elif any(k in headline_l for k in ["nasdaq", "tech", "software", "ai", "semiconductor", "cloud"]):
+                        mechanism = "Sector-wide selling spills into correlated AI/software names, dragging " + ticker.upper() + " with peers."
+                    elif any(k in headline_l for k in ["war", "conflict", "sanctions", "tariffs", "geopolitical", "export controls"]):
+                        mechanism = "Geopolitical stress raises risk premiums and can compress multiples for high-growth tech."
+                    elif any(k in headline_l for k in ["defense", "government", "budget", "contract", "shutdown"]):
+                        mechanism = "Government spending uncertainty can hit contractors and related tech vendors, weighing on sentiment."
+                    else:
+                        continue
+                    reasons.append(f"{idx}. Macro/political headline pressure: {headline}. {mechanism} {src_txt}")
+            else:
+                reasons.append(
+                    "1. No verified, event-driven headlines in the past 7 days from available sources. I won't speculate beyond the data provided."
+                )
+
+            # Reason 2: Technical momentum
+            if rsi_val is not None:
+                reasons.append(
+                    f"2. Technical momentum: RSI at {rsi_val:.1f} suggests {'oversold selling pressure' if rsi_val < 30 else 'overbought risk' if rsi_val > 70 else 'neutral momentum'}, which can accelerate near-term moves."
+                )
+            elif daily_trend or weekly_trend:
+                reasons.append(f"2. Trend confirmation: {daily_trend or weekly_trend} trend implies sustained directional pressure.")
+            else:
+                reasons.append("2. Technical context was limited, reducing confidence in a precise directional call.")
+
+            # Reason 3: Key levels if available
+            if support or resistance:
+                lvl_bits = []
+                if support:
+                    lvl_bits.append(f"support {support}")
+                if resistance:
+                    lvl_bits.append(f"resistance {resistance}")
+                reasons.append(f"3. Key levels: price is reacting around {', '.join(lvl_bits)}, which often drives short-term volatility and stop-driven moves.")
+            else:
+                reasons.append("3. With limited confirmed news catalysts, broader market positioning can dominate short-term price action.")
+
+            # Build forward-looking prediction
+            prediction = "\n\n**What's next:** "
+            if rsi_val is not None and rsi_val < 30:
+                if support:
+                    prediction += f"Oversold bounce likely in 2-5 days targeting {resistance or 'prior highs'} as short-term sellers exhaust. If {support} breaks, next leg down accelerates. Key level to watch: {support}."
+                else:
+                    prediction += f"Oversold conditions suggest near-term bounce attempt, but without clear support, downside remains open. Watch for reversal patterns on shorter timeframes."
+            elif rsi_val is not None and rsi_val > 70:
+                if resistance:
+                    prediction += f"Overbought readings suggest pullback risk to {support or 'recent lows'} within 3-7 days. Breaking {resistance} would signal continued strength, but odds favor consolidation first."
+                else:
+                    prediction += f"Overbought territory - expect profit-taking. Momentum can stay elevated, but risk/reward favors waiting for a dip."
+            elif daily_trend and "up" in daily_trend.lower():
+                prediction += f"Uptrend intact - dips to {support or 'lower levels'} are likely buyable. Target {resistance or 'next resistance'} on continuation. Break below {support or 'recent lows'} would negate bullish structure."
+            elif daily_trend and "down" in daily_trend.lower():
+                prediction += f"Downtrend persists - rallies to {resistance or 'overhead resistance'} are likely selling opportunities. Break above {resistance or 'key resistance'} needed to reverse bearish bias."
+            else:
+                prediction += f"Range-bound action likely until a catalyst emerges or {resistance or 'resistance'} / {support or 'support'} breaks. Position for breakout rather than predicting direction."
+
+            summary = " ".join(summary_parts).strip()
+            return f"{summary}\n" + "\n".join(reasons) + prediction
+
+        def _parse_datetime(value) -> Optional[datetime]:
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                ts = float(value)
+                if ts > 1e12:
+                    ts = ts / 1000.0
+                try:
+                    return datetime.fromtimestamp(ts)
+                except Exception:
+                    return None
+            if isinstance(value, str):
+                v = value.strip()
+                if not v:
+                    return None
+                if v.lower() in ["recent", "past week"]:
+                    return None
+                if v.endswith("Z"):
+                    v = v.replace("Z", "+00:00")
+                try:
+                    return datetime.fromisoformat(v)
+                except Exception:
+                    pass
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                    try:
+                        return datetime.strptime(v, fmt)
+                    except Exception:
+                        continue
+            return None
+
+        def _is_within_last_week(value) -> bool:
+            dt = _parse_datetime(value)
+            if not dt:
+                return False
+            if dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
+            return dt >= datetime.now() - timedelta(days=7)
         
         def generate_smart_search_queries(ticker: str, user_question: str) -> List[str]:
             """Use Groq to intelligently determine what news/searches would answer the user's question."""
@@ -8816,6 +9263,70 @@ Search queries:"""
             except Exception as e:
                 logger.debug(f"Smart query generation failed: {e}")
                 return [ticker]
+
+        def build_broader_queries(ticker: str, user_question: str = "") -> List[str]:
+            """Build broader macro/sector/peer queries that may affect a ticker."""
+            queries = []
+
+            # Company context (name/industry)
+            try:
+                profile = FinnhubAnalyzer.get_company_profile(ticker)
+                company_name = profile.get('company_name') or profile.get('name') or ""
+                industry = profile.get('industry') or ""
+                if company_name:
+                    queries.append(f"{company_name} contracts")
+                    queries.append(f"{company_name} government")
+                    queries.append(f"{company_name} earnings")
+                    queries.append(f"{company_name} guidance")
+                if industry:
+                    queries.append(f"{industry} sector news")
+                    queries.append(f"{industry} stocks selloff")
+            except Exception:
+                pass
+
+            # Macro/sector themes that broadly affect tech/gov/AI names
+            macro_terms = [
+                "global tensions",
+                "geopolitical tensions",
+                "defense spending",
+                "government contracts",
+                "federal budget",
+                "U.S. government shutdown",
+                "AI regulation",
+                "data privacy regulation",
+                "cybersecurity threats",
+                "tech sector selloff",
+                "NASDAQ decline",
+                "software stocks",
+                "cloud spending slowdown",
+                "enterprise IT spending"
+            ]
+            queries.extend(macro_terms)
+
+            # Ticker-specific peers/themes (extend as needed)
+            peer_map = {
+                "PLTR": [
+                    "Palantir", "government IT contracts", "defense tech", "AI software stocks",
+                    "data analytics stocks", "intelligence software", "SNOW earnings", "DDOG earnings", "AI stock"
+                ]
+            }
+            peers = peer_map.get(ticker.upper(), [])
+            queries.extend(peers)
+
+            # Include user keywords if provided
+            if user_question:
+                queries.append(user_question)
+
+            # Deduplicate and trim
+            seen = set()
+            unique = []
+            for q in queries:
+                q = q.strip()
+                if not q or q.lower() in seen:
+                    continue
+                seen.add(q.lower())
+                unique.append(q)
+            return unique[:20]
         
         def scrape_diverse_news_sources(ticker: str) -> List[Dict[str, str]]:
             """
@@ -8841,10 +9352,13 @@ Search queries:"""
                 'MarketWatch Top News': "https://www.marketwatch.com/story/latest-news",
                 'CNBC Latest': "https://www.cnbc.com/latest/",
                 'Reuters Top News': "https://www.reuters.com/",
+                'Reuters Markets': "https://www.reuters.com/markets/",
                 'BBC Business': "https://www.bbc.com/news/business",
                 'Yahoo Finance Markets': "https://finance.yahoo.com/markets/",
                 'AP Finance': "https://apnews.com/hub/business",
                 'Economic Times Top': "https://economictimes.indiatimes.com/markets/stocks/news",
+                'Motley Fool Latest': "https://www.fool.com/investing/",
+                'Barrons Markets': "https://www.barrons.com/market-data",
             }
             
             # Define one week ago date for filtering
@@ -8875,10 +9389,10 @@ Search queries:"""
                         found_elements.extend(soup.find_all(tag, attrs))
                     
                     # Also try generic link extraction
-                    all_links = soup.find_all('a', href=True, limit=100)
+                    all_links = soup.find_all('a', href=True, limit=300)
                     
                     for element in found_elements + all_links:
-                        if articles_found >= 15:
+                        if articles_found >= 40:
                             break
                         
                         # Get text and href
@@ -8939,7 +9453,7 @@ Search queries:"""
             
             # If we got some articles, return them
             if all_articles:
-                return all_articles[:40]  # Get up to 40 articles across all sources
+                return all_articles[:150]  # Get up to 150 articles across all sources
             
             # FALLBACK: Use existing NewsAnalyzer APIs if scraping failed
             logger.debug("Scraping limited, using API fallback...")
@@ -8957,7 +9471,62 @@ Search queries:"""
             except:
                 pass
             
-            return all_articles[:40]
+            return all_articles[:150]
+
+        def fetch_recent_rss_articles() -> List[Dict[str, str]]:
+            """Fetch recent articles with timestamps from RSS feeds."""
+            try:
+                import requests
+                import xml.etree.ElementTree as ET
+                from email.utils import parsedate_to_datetime
+            except Exception:
+                return []
+
+            feeds = {
+                "Reuters Markets": "https://feeds.reuters.com/reuters/marketsNews",
+                "Reuters Top News": "https://feeds.reuters.com/reuters/topNews",
+                "CNBC Top News": "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+                "Yahoo Finance": "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC&region=US&lang=en-US",
+                "MarketWatch": "https://feeds.marketwatch.com/marketwatch/topstories/",
+                "Barrons": "https://www.barrons.com/rss",
+                "Motley Fool": "https://www.fool.com/a/feeds/foolwire.aspx",
+                "BBC Business": "http://feeds.bbci.co.uk/news/business/rss.xml",
+            }
+
+            items = []
+            for source, url in feeds.items():
+                try:
+                    resp = requests.get(url, timeout=10)
+                    if resp.status_code != 200:
+                        continue
+                    root = ET.fromstring(resp.content)
+                    for item in root.findall(".//item"):
+                        title = (item.findtext("title") or "").strip()
+                        link = (item.findtext("link") or "").strip()
+                        pub = (item.findtext("pubDate") or "").strip()
+                        desc = (item.findtext("description") or "").strip()
+                        if not title or not link or not pub:
+                            continue
+                        try:
+                            dt = parsedate_to_datetime(pub)
+                        except Exception:
+                            continue
+                        if dt.tzinfo is not None:
+                            dt = dt.replace(tzinfo=None)
+                        if dt < datetime.now() - timedelta(days=7):
+                            continue
+                        items.append({
+                            "title": title[:200],
+                            "url": link[:500],
+                            "source": source,
+                            "date": dt.isoformat(),
+                            "description": desc[:500],
+                            "category": "RSS"
+                        })
+                except Exception:
+                    continue
+
+            return items[:300]
         
         def generate_comprehensive_analysis(ticker: str, articles: List[Dict[str, str]]) -> str:
             """
@@ -8982,9 +9551,10 @@ Search queries:"""
                 # Fetch live price and technical data
                 price_context = ""
                 try:
-                    df = DataManager.get_data(ticker, period='5d', interval='1h')
+                    df = DataManager.fetch_data(ticker, period='5d', interval='1h')
                     if df is not None and len(df) > 0:
-                        current_price = float(df['Close'].iloc[-1])
+                        live_price = DataManager.get_realtime_price(ticker)
+                        current_price = float(live_price) if live_price is not None else float(df['Close'].iloc[-1])
                         day_high = float(df['High'].iloc[-1])
                         day_low = float(df['Low'].iloc[-1])
                         
@@ -9061,52 +9631,31 @@ CRITICAL INSTRUCTIONS - YOU MUST FOLLOW THESE EXACTLY:
 1. Read and understand ALL {verified_count} verified articles provided above.
 2. Also NOTE the {rumor_count} unverified rumors below, but DO NOT treat them as facts.
 3. Do NOT use generic knowledge - only analyze these specific articles AND the live price data.
-4. Cite specific article numbers when discussing VERIFIED news.
+4. Cite VERIFIED news by title + link, not by article numbers.
 5. When discussing rumors, clearly mark them as "unverified speculation from [source]"
 6. Create a UNIFIED opinion by finding themes, patterns, and consensus across VERIFIED sources.
 7. Connect the news narrative to the current price action and technical levels.
+8. Infer second-order (domino) impacts on {ticker} even if the article doesn’t mention it, but ONLY if the link is plausible from the articles provided. Explicitly state the chain of impact.
 
 **YOUR COMPREHENSIVE MARKET OPINION FOR {ticker}**:
 
 **SYNTHESIS & DOMINANT NARRATIVE** (Based on Verified Sources):
-What story do these {verified_count} verified articles collectively tell about {ticker}? How does this narrative align with or contradict the current price action?
-- What is the consensus sentiment across verified sources?
-- What are the common themes? List the top 3-5 recurring themes across verified articles.
-- Are rumors/speculation amplifying or contradicting the verified narrative?
-- How does the price action (today's change, weekly change, RSI level) support or contradict this narrative?
-- Are there any conflicting narratives? If so, which appears more credible and why?
+Explain the story in paragraph form. Explicitly name the event(s) from the articles and describe how they plausibly impact {ticker} (causal chain). Avoid bullet points.
 
 **DETAILED CAUSAL ANALYSIS** (Connect verified events to stock impact):
-For each major theme identified above:
-1. THEME: [Name the theme]
-2. VERIFIED SOURCE ARTICLES: [List 2-3 article numbers that support this]
-3. THE FACTS: [Specific quotes/facts from those articles]
-4. WHY IT MATTERS: [How does this directly affect {ticker}'s business fundamentals?]
-5. STOCK IMPACT: [Will this drive price up, down, or stay neutral? Why?]
-6. TIMELINE: [When will investors react to this?]
-7. RUMOR CONNECTIONS: [Are any circulating rumors related to this theme? Are they plausible given verified facts?]
+Write 2-3 short paragraphs. Each paragraph must:
+- Name the event explicitly (from article title) and include its link
+- Explain the chain of impact to {ticker}
+- State expected timing (immediate/days/weeks)
 
 **CATALYSTS RANKED BY IMPACT** (Verified Sources Only):
-List the 3-5 most important catalysts from VERIFIED articles:
-1. [CATALYST]: [Article X, Y, Z sources] - Impact: [POSITIVE/NEGATIVE/NEUTRAL] - Why: [Detailed reasoning]
-2. [CATALYST]: ...
+Describe the top catalysts in paragraph form, each with title + link and impact.
 
 **RUMORS & SPECULATION TRACKER**:
-What {rumor_count} unverified rumors are circulating about {ticker}? 
-- Do they align with verified facts or contradict them?
-- What is the market sentiment around these rumors (are traders betting they're true)?
-- How likely are these rumors to affect price action even if unconfirmed?
-- Rate each rumor's plausibility based on verified facts: [HIGH/MEDIUM/LOW plausibility]
+If present, summarize in a short paragraph and clearly mark as unverified. No bullet points.
 
 **THE BOTTOM LINE OPINION** (Combining Verified News + Current Price Action):
-Based on synthesizing VERIFIED articles and current price action:
-- Should {ticker} trade UP, DOWN, or SIDEWAYS? [Give clear direction with confidence]
-- Conviction level: [HIGH/MEDIUM/LOW] - Why is your conviction this strong?
-- Does the current price action (RSI={current_rsi:.0f}, {day_change_pct:+.1f}% today) align with verified news sentiment? Or is there a divergence?
-- Could unverified rumors be driving any divergence between verified sentiment and price action?
-- If diverging: Which is more likely to win - price catching up to sentiment, or sentiment shifting toward price?
-- Key assumption: [What needs to stay true for your opinion to be correct?]
-- What could change your mind: [What verified news would reverse your opinion?]
+Provide a concise paragraph with direction, conviction, and how price action aligns with the events.
 
 **SPECIFIC STOCK PRICE DIRECTION WITH TARGETS**:
 Given all VERIFIED news from these {verified_count} sources AND current price of ${current_price:.2f}:
@@ -9221,6 +9770,49 @@ Remember: Every claim about verified facts must be traceable to specific article
                 logger.debug(f"DuckDuckGo search error: {str(e)[:50]}")
             
             return []
+
+        def fetch_general_news_for_query(query: str) -> None:
+            """Fetch general recent news (with links) for non-ticker questions."""
+            nonlocal stored_news
+            stored_news = []
+            articles = []
+            try:
+                # NewsData query
+                nd_articles = NewsDataAnalyzer.search_event_impact(query, limit=25)
+                if nd_articles:
+                    for article in nd_articles:
+                        if not _is_within_last_week(article.get('timestamp') or article.get('date')):
+                            continue
+                        articles.append({
+                            'title': article.get('title', ''),
+                            'url': article.get('url', ''),
+                            'source': article.get('source', 'NewsData'),
+                            'date': article.get('timestamp', ''),
+                            'category': article.get('category', 'News')
+                        })
+            except Exception as e:
+                logger.debug(f"General NewsData query error: {e}")
+
+            # RSS items filtered by query keywords
+            try:
+                rss_items = fetch_recent_rss_articles()
+                if rss_items:
+                    q = query.lower()
+                    for item in rss_items:
+                        title = (item.get('title') or '').lower()
+                        if any(word for word in q.split() if word and word in title):
+                            articles.append(item)
+            except Exception as e:
+                logger.debug(f"General RSS filter error: {e}")
+
+            if articles:
+                for article in articles:
+                    stored_news.append({
+                        'title': article.get('title', 'Unknown'),
+                        'url': article.get('url', ''),
+                        'sentiment': 'NEUTRAL',
+                        'source': article.get('source', 'News')
+                    })
         
         def get_company_context(ticker: str) -> str:
             """Fetch analyst ratings, earnings dates, and company profile from Finnhub/SEC."""
@@ -9272,17 +9864,91 @@ Remember: Every claim about verified facts must be traceable to specific article
                 logger.setLevel(logging.ERROR)
                 
                 console.print(f"[cyan]🌍 Searching for news on {ticker} (Company + Geopolitical + Market)...[/cyan]")
+
+                # GLOBAL: pull broad past-week news (market/economy/tech/geopolitics) regardless of ticker
+                try:
+                    broad_queries = [
+                        "global markets",
+                        "stock market",
+                        "business news",
+                        "economy",
+                        "inflation",
+                        "interest rates",
+                        "central bank",
+                        "geopolitical",
+                        "global tensions",
+                        "technology sector",
+                        "AI industry",
+                        "cybersecurity",
+                        "defense spending",
+                        "government contracts"
+                    ]
+                    for q in broad_queries:
+                        nd_articles = NewsDataAnalyzer.search_event_impact(q, limit=10)
+                        if nd_articles:
+                            for article in nd_articles:
+                                if not _is_within_last_week(article.get('timestamp') or article.get('date')):
+                                    continue
+                                articles.append({
+                                    'title': article.get('title', ''),
+                                    'url': article.get('url', ''),
+                                    'source': article.get('source', 'NewsData'),
+                                    'date': article.get('timestamp', ''),
+                                    'category': article.get('category', 'Market News')
+                                })
+                    console.print("[green]✓ NewsData.IO: Broad global news sweep completed[/green]")
+                except Exception as e:
+                    logger.debug(f"NewsData.IO broad sweep error: {e}")
+
+                # RSS feeds with timestamps (high-priority for recency)
+                try:
+                    rss_items = fetch_recent_rss_articles()
+                    if rss_items:
+                        for article in rss_items:
+                            if not _is_within_last_week(article.get('date')):
+                                continue
+                            articles.append(article)
+                        console.print(f"[green]✓ RSS feeds: {len(rss_items)} recent articles[/green]")
+                except Exception as e:
+                    logger.debug(f"RSS fetch error: {e}")
+
+                # GROQ-guided NewsData queries (signal from Groq -> NewsData)
+                if use_groq and user_question:
+                    try:
+                        smart_queries = generate_smart_search_queries(ticker, user_question)
+                        broader_queries = build_broader_queries(ticker, user_question)
+                        combined_queries = list(dict.fromkeys(smart_queries + broader_queries))
+
+                        for q in combined_queries:
+                            nd_articles = NewsDataAnalyzer.search_event_impact(q, limit=25)
+                            if nd_articles:
+                                for article in nd_articles:
+                                    if not _is_within_last_week(article.get('timestamp') or article.get('date')):
+                                        continue
+                                    articles.append({
+                                        'title': article.get('title', ''),
+                                        'url': article.get('url', ''),
+                                        'source': article.get('source', 'NewsData'),
+                                        'date': article.get('timestamp', ''),
+                                        'category': article.get('category', 'Market News')
+                                    })
+                        if combined_queries:
+                            console.print(f"[green]✓ Groq → NewsData: {len(combined_queries)} smart+macro query signals[/green]")
+                    except Exception as e:
+                        logger.debug(f"Groq-guided NewsData search error: {e}")
                 
                 # PRIMARY: Finnhub - Real-time company-specific news
                 try:
                     finnhub_articles = FinnhubAnalyzer.get_news(ticker, limit=20)
                     if finnhub_articles:
                         for article in finnhub_articles:
+                            if not _is_within_last_week(article.get('timestamp')):
+                                continue
                             articles.append({
                                 'title': article.get('title', ''),
                                 'url': article.get('url', ''),
                                 'source': article.get('source', 'Finnhub'),
-                                'date': 'Recent',
+                                'date': article.get('timestamp', ''),
                                 'category': 'Company News'
                             })
                         console.print(f"[green]✓ Finnhub: {len(finnhub_articles)} company news articles[/green]")
@@ -9294,6 +9960,8 @@ Remember: Every claim about verified facts must be traceable to specific article
                     sec_filings = SECEdgarAnalyzer.get_recent_filings(ticker, form_types=['10-K', '10-Q', '8-K'], limit=5)
                     if sec_filings:
                         for filing in sec_filings:
+                            if not _is_within_last_week(filing.get('filing_date')):
+                                continue
                             articles.append({
                                 'title': f"SEC {filing['form_type']} Filing - {filing.get('filing_date', 'Recent')}",
                                 'url': filing.get('url', ''),
@@ -9310,6 +9978,8 @@ Remember: Every claim about verified facts must be traceable to specific article
                     insider_trades = FinnhubAnalyzer.get_insider_trades(ticker, limit=5)
                     if insider_trades:
                         for trade in insider_trades:
+                            if not _is_within_last_week(trade.get('filed_date')):
+                                continue
                             articles.append({
                                 'title': f"INSIDER TRADE: {trade.get('name', 'Officer')} - {trade.get('transaction', 'BUY/SELL')} {trade.get('shares', 0)} shares",
                                 'url': f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type=4",
@@ -9323,27 +9993,31 @@ Remember: Every claim about verified facts must be traceable to specific article
                 
                 # QUATERNARY: NewsData.IO - Geopolitical & Market News that affects stocks
                 try:
-                    geopolitical_news = NewsDataAnalyzer.get_geopolitical_news(limit=10)
+                    geopolitical_news = NewsDataAnalyzer.get_geopolitical_news(limit=25)
                     if geopolitical_news:
                         for article in geopolitical_news:
+                            if not _is_within_last_week(article.get('timestamp')):
+                                continue
                             articles.append({
                                 'title': article.get('title', ''),
                                 'url': article.get('url', ''),
                                 'source': article.get('source', 'NewsData'),
-                                'date': 'Recent',
+                                'date': article.get('timestamp', ''),
                                 'category': 'Geopolitical/Macro Event'
                             })
                         console.print(f"[green]✓ NewsData.IO: {len(geopolitical_news)} geopolitical/macro events[/green]")
                     
                     # Also get market-specific news from NewsData.IO
-                    market_news = NewsDataAnalyzer.get_market_news(limit=10)
+                    market_news = NewsDataAnalyzer.get_market_news(limit=25)
                     if market_news:
                         for article in market_news:
+                            if not _is_within_last_week(article.get('timestamp')):
+                                continue
                             articles.append({
                                 'title': article.get('title', ''),
                                 'url': article.get('url', ''),
                                 'source': article.get('source', 'NewsData'),
-                                'date': 'Recent',
+                                'date': article.get('timestamp', ''),
                                 'category': 'Market News'
                             })
                         console.print(f"[green]✓ NewsData.IO: {len(market_news)} market news articles[/green]")
@@ -9352,14 +10026,16 @@ Remember: Every claim about verified facts must be traceable to specific article
                 
                 # QUINTERNARY: Rumors & Unverified Speculation
                 try:
-                    rumors = NewsDataAnalyzer.get_rumors_and_speculation(ticker, limit=8)
+                    rumors = NewsDataAnalyzer.get_rumors_and_speculation(ticker, limit=15)
                     if rumors:
                         for rumor in rumors:
+                            if not _is_within_last_week(rumor.get('timestamp')):
+                                continue
                             articles.append({
                                 'title': f"⚠️ RUMOR: {rumor.get('title', '')}",
                                 'url': rumor.get('url', ''),
                                 'source': f"{rumor.get('source', 'NewsData')} [UNVERIFIED]",
-                                'date': 'Recent',
+                                'date': rumor.get('timestamp', ''),
                                 'category': 'Unverified Rumor/Speculation',
                                 'verified': False,
                                 'confidence': 'UNVERIFIED'
@@ -9367,6 +10043,36 @@ Remember: Every claim about verified facts must be traceable to specific article
                         console.print(f"[yellow]⚠️  Rumors/Speculation: {len(rumors)} unverified reports found[/yellow]")
                 except Exception as e:
                     logger.debug(f"Rumors fetch error: {e}")
+
+                # NewsData ticker-specific search (past week only)
+                try:
+                    ticker_news = NewsDataAnalyzer.search_ticker_news(ticker, limit=25)
+                    if ticker_news:
+                        for article in ticker_news:
+                            if not _is_within_last_week(article.get('timestamp')):
+                                continue
+                            articles.append({
+                                'title': article.get('title', ''),
+                                'url': article.get('url', ''),
+                                'source': article.get('source', 'NewsData'),
+                                'date': article.get('timestamp', ''),
+                                'category': 'Ticker News'
+                            })
+                        console.print(f"[green]✓ NewsData.IO: {len(ticker_news)} ticker-specific articles[/green]")
+                except Exception as e:
+                    logger.debug(f"NewsData.IO ticker search error: {e}")
+
+                # Additional web sources (already scoped to past week)
+                try:
+                    scraped = scrape_diverse_news_sources(ticker)
+                    if scraped:
+                        for article in scraped:
+                            if not _is_within_last_week(article.get('date', 'Past Week')):
+                                continue
+                            articles.append(article)
+                        console.print(f"[green]✓ Web sources: {len(scraped)} recent headlines[/green]")
+                except Exception as e:
+                    logger.debug(f"Web scrape error: {e}")
                 
                 # FALLBACK: DuckDuckGo web search if minimal results
                 if len(articles) < 5:
@@ -9379,7 +10085,7 @@ Remember: Every claim about verified facts must be traceable to specific article
                                     'title': article.get('title', ''),
                                     'url': article.get('url', ''),
                                     'source': article.get('source', 'Web'),
-                                    'date': 'Recent',
+                                    'date': 'Past Week',
                                     'category': 'General News'
                                 })
                             console.print(f"[green]✓ Web search: {len(ddg_articles)} additional articles[/green]")
@@ -9769,19 +10475,29 @@ List:"""
                 if not user_message.strip():
                     continue
                 
+                # Check if this is a general question (not market-related)
+                user_msg_lower = user_message.lower()
+                general_question_patterns = ['what day', 'what time', 'what year', 'who is', 'who are', 'how are you', 'hello', 'hi ', 'hey ', 'good morning', 'good afternoon', 'what is your', 'help', 'thank you', 'thanks', 'when is', 'where is']
+                is_general_question = any(pattern in user_msg_lower for pattern in general_question_patterns)
+                
                 # Extract ticker if user asks about a stock
-                mentioned_ticker = extract_ticker_from_message(user_message)
+                mentioned_ticker = extract_ticker_from_message(user_message) if not is_general_question else None
                 news_context = ""
                 tech_context = ""
                 
                 # Check what type of analysis is being requested
-                user_msg_lower = user_message.lower()
-                asking_about_news = any(phrase in user_msg_lower for phrase in ['why is', 'why has', 'why did', 'why are', 'going up', 'going down', 'dropping', 'rising', 'jumping', 'falling', 'crashed', 'soared', 'news', 'catalyst', 'events'])
-                asking_about_technical = any(phrase in user_msg_lower for phrase in ['technical', 'rsi', 'support', 'resistance', 'trend', 'momentum', 'chart', 'moving average', 'ma50', 'ma200', 'signal', 'macd', 'pattern', 'levels', 'oversold', 'overbought', 'pivot', 'fibonacci'])
-                asking_about_fundamentals = any(phrase in user_msg_lower for phrase in ['earnings', 'analyst', 'rating', 'valuation', 'pe', 'eps', 'fundamentals', 'company'])
+                asking_about_news = any(phrase in user_msg_lower for phrase in ['why is', 'why has', 'why did', 'why are', 'going up', 'going down', 'dropping', 'rising', 'jumping', 'falling', 'crashed', 'soared', 'news', 'catalyst', 'events']) and not is_general_question
+                asking_about_technical = any(phrase in user_msg_lower for phrase in ['technical', 'rsi', 'support', 'resistance', 'trend', 'momentum', 'chart', 'moving average', 'ma50', 'ma200', 'signal', 'macd', 'pattern', 'levels', 'oversold', 'overbought', 'pivot', 'fibonacci']) and not is_general_question
+                asking_about_fundamentals = any(phrase in user_msg_lower for phrase in ['earnings', 'analyst', 'rating', 'valuation', 'pe', 'eps', 'fundamentals', 'company']) and not is_general_question
                 
+                # Use last mentioned ticker for follow-up news queries
+                if not mentioned_ticker and asking_about_news and last_mentioned_ticker:
+                    mentioned_ticker = last_mentioned_ticker
+                    console.print(f"[dim]Using last ticker for news: {mentioned_ticker}[/dim]")
+
                 # Fetch relevant data based on query type
                 if mentioned_ticker:
+                    last_mentioned_ticker = mentioned_ticker
                     with console.status(f"[bold cyan]📊 Loading {mentioned_ticker} data...[/bold cyan]", spinner="dots"):
                         # Always fetch technical analysis if ticker mentioned
                         if asking_about_technical or asking_about_news or any(phrase in user_msg_lower for phrase in ['analyze', 'what do you think', 'opinion', 'outlook', 'forecast']):
@@ -9793,18 +10509,21 @@ List:"""
                         # Fetch news for "why is" questions or general outlook questions
                         if asking_about_news or asking_about_fundamentals:
                             news_context = fetch_news_for_ticker(mentioned_ticker, user_message)
+                else:
+                    if asking_about_news:
+                        fetch_general_news_for_query(user_message)
+                        news_context = build_news_context_from_stored("GENERAL")
                 
                 # Show thinking indicator
                 with console.status("[bold green]🧠 Groq analyzing (with real technical & news data)...[/bold green]", spinner="dots"):
-                    # Build message with all context for Groq
                     full_message = user_message
                     if news_context or tech_context:
                         full_message += f"\n\n[REAL DATA FROM YOUR ENGINE]:\n{tech_context}"
                         if news_context:
                             full_message += f"\n{news_context}"
-                    
+
                     conversation_history.append({"role": "user", "content": full_message})
-                    
+
                     try:
                         response = groq_client.chat.completions.create(
                             model="llama-3.3-70b-versatile",
@@ -9817,7 +10536,6 @@ List:"""
                         )
                         
                         ai_response = response.choices[0].message.content
-                        conversation_history.append({"role": "assistant", "content": ai_response})
                     except Exception as api_error:
                         console.print(f"[red]❌ Groq API Error: {str(api_error)[:150]}[/red]")
                         console.print("[yellow]Troubleshooting:[/yellow]")
@@ -9825,9 +10543,104 @@ List:"""
                         console.print("2. Verify you have credits/subscription active")
                         console.print("3. Try updating your API key in settings")
                         raise
+
+                        # CRITICAL: Remove any trailing questions or offers
+                        lines = ai_response.split('\n')
+                        cleaned_lines = []
+                        for line in lines:
+                            # Skip any line that's a question (ends with ?)
+                            if line.strip().endswith('?'):
+                                continue
+                            # Skip lines that offer to do something
+                            offer_phrases = ['Want', 'Would', 'Should', 'Let me', 'Let us', 'I could', "I'd love", "I'd be happy", "I'd recommend checking", "I can help", 'Do you want']
+                            if any(line.strip().startswith(p) for p in offer_phrases):
+                                continue
+                            cleaned_lines.append(line)
+                        
+                        ai_response = '\n'.join(cleaned_lines).strip()
+                        
+                        # If response is empty after cleaning, provide default
+                        if not ai_response:
+                            ai_response = "Based on the data provided, I don't have enough information to give a clear analysis right now."
+
+                        # If response is vague/non-specific, replace with structured fallback
+                        vague_markers = [
+                            "no direct information",
+                            "lack of",
+                            "difficult to determine",
+                            "no verified",
+                            "confidence level in this opinion is 0",
+                            "not supported or contradicted",
+                            "no specific information"
+                        ]
+                        if any(m in ai_response.lower() for m in vague_markers):
+                            ai_response = build_fallback_reasoning(mentioned_ticker or "This stock", tech_context, stored_news)
+
+                        # Guard against generic model disclaimers
+                        disclaimer_markers = [
+                            "i don't have access to real-time news",
+                            "training data only goes up to",
+                            "i don't have the ability to browse"
+                        ]
+                        if any(m in ai_response.lower() for m in disclaimer_markers):
+                            event_text = build_event_paragraphs(mentioned_ticker or "This stock", stored_news)
+                            ai_response = event_text or "No verified company-specific catalyst in the past 7 days; price likely driven by broader sector/macro pressure."
+
+                        conversation_history.append({"role": "assistant", "content": ai_response})
                 
+                # If response is vague or lacks concrete events, replace with event-based paragraphs
+                if mentioned_ticker:
+                    needs_event_override = ("http" not in ai_response.lower()) or any(
+                        m in ai_response.lower() for m in [
+                            "no verified", "no direct information", "lack of", "difficult to determine",
+                            "not supported", "no specific"
+                        ]
+                    )
+                    if needs_event_override:
+                        event_text = build_event_paragraphs(mentioned_ticker, stored_news)
+                        if event_text:
+                            ai_response = event_text
+
                 # Display response
                 console.print(f"\n[bold green]🤖 AI Trade Advisor[/bold green]: {ai_response}\n")
+
+                # Trading bot technical signals (full TA)
+                if mentioned_ticker:
+                    try:
+                        if self.analyzer is None:
+                            self.analyzer = AIAnalyzer(self.api_key or "")
+                        df_for_bot = DataManager.fetch_data(mentioned_ticker, "1y", "1d")
+                        indicators = calculate_indicators(df_for_bot) if df_for_bot is not None else None
+                        if indicators is not None:
+                            account_size = float((self.config or {}).get('account_size', 10000.0))
+                            risk_per_trade = float((self.config or {}).get('risk_per_trade', 2.0)) / 100.0
+                            desired_rrr = float((self.config or {}).get('default_rrr', 2.0))
+                            trade_summary = self.analyzer._fallback_analysis(
+                                mentioned_ticker,
+                                indicators,
+                                account_size,
+                                risk_per_trade,
+                                desired_rrr
+                            )
+                            last_trade_summary = trade_summary
+                            console.print("\n[bold cyan]📌 Trading Bot Technical Signals[/bold cyan]")
+                            DisplayManager.show_trade_recommendation(trade_summary)
+
+                            # Show indicator table
+                            try:
+                                DisplayManager.show_indicators(indicators)
+                            except Exception:
+                                pass
+
+                            # Generate chart with patterns/market structure
+                            try:
+                                patterns = PatternRecognizer.analyze(df_for_bot)
+                                market_structure = SmartMoneyAnalyzer.analyze(df_for_bot, mentioned_ticker)
+                                self._generate_analysis_chart(mentioned_ticker, df_for_bot, trade_summary, patterns, market_structure, indicators)
+                            except Exception as e:
+                                logger.debug(f"Chart generation skipped: {e}")
+                    except Exception as e:
+                        logger.debug(f"Trading bot TA error: {e}")
                 
                 # Keep conversation history manageable
                 if len(conversation_history) > 24:
@@ -13024,10 +13837,17 @@ List:"""
         console.print(f"[dim]Report saved to: {filename}[/dim]")
     
     def _generate_analysis_chart(self, ticker: str, df: pd.DataFrame, trade: TradeSummary, 
-                                 patterns: 'PatternAnalysis', market_structure: 'MarketStructure'):
+                                 patterns: 'PatternAnalysis', market_structure: 'MarketStructure', 
+                                 indicators: 'AdvancedIndicators' = None):
         """Generate chart with buy/sell signals, stop loss, take profit levels, patterns, and FVGs."""
         try:
-            import matplotlib
+            try:
+                import matplotlib
+            except ImportError:
+                console.print("[yellow]Installing matplotlib...[/yellow]")
+                import subprocess
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "matplotlib"])
+                import matplotlib
             matplotlib.use('Agg')
             import matplotlib.pyplot as plt
             from matplotlib.patches import Rectangle, Circle, Polygon, FancyBboxPatch
@@ -13281,11 +14101,454 @@ List:"""
                 os.startfile(str(chart_path))
             except Exception:
                 pass
+            
+            # Generate interactive HTML chart with Plotly
+            try:
+                html_path = self._generate_interactive_html_chart(ticker, df, trade, patterns, market_structure, indicators, chart_dir, timestamp)
+                if html_path:
+                    console.print(f"[green]🌐 Interactive chart saved: {html_path}[/green]")
+                    # Auto-open in browser
+                    try:
+                        import webbrowser
+                        webbrowser.open(f'file://{html_path}')
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug(f"Interactive chart generation skipped: {e}")
                 
         except Exception as e:
             console.print(f"[yellow]Chart generation failed: {e}[/yellow]")
             import traceback
             traceback.print_exc()
+    
+    def _generate_interactive_html_chart(self, ticker: str, df: pd.DataFrame, trade: TradeSummary,
+                                        patterns: 'PatternAnalysis', market_structure: 'MarketStructure',
+                                        indicators: 'AdvancedIndicators', chart_dir: Path, timestamp: str) -> Optional[Path]:
+        """Generate interactive HTML candlestick chart using Plotly with ALL terminal information."""
+        try:
+            try:
+                import plotly.graph_objects as go
+                from plotly.subplots import make_subplots
+            except ImportError:
+                console.print("[yellow]Installing plotly...[/yellow]")
+                import subprocess
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "plotly"])
+                import plotly.graph_objects as go
+                from plotly.subplots import make_subplots
+            
+            # Prepare data (last 250 candles for cleaner display)
+            plot_df = df.tail(250).copy()
+            plot_df = plot_df.reset_index()
+            
+            # Ensure proper column names
+            if 'Date' not in plot_df.columns and 'index' in plot_df.columns:
+                plot_df['Date'] = plot_df['index']
+            
+            # Create figure with candlestick chart
+            fig = go.Figure()
+            
+            # Add candlestick trace
+            fig.add_trace(go.Candlestick(
+                x=plot_df['Date'],
+                open=plot_df['Open'] if 'Open' in plot_df.columns else plot_df['open'],
+                high=plot_df['High'] if 'High' in plot_df.columns else plot_df['high'],
+                low=plot_df['Low'] if 'Low' in plot_df.columns else plot_df['low'],
+                close=plot_df['Close'] if 'Close' in plot_df.columns else plot_df['close'],
+                name=ticker,
+                increasing_line_color='#00ff00',
+                decreasing_line_color='#ff0000',
+                increasing_fillcolor='#003300',
+                decreasing_fillcolor='#ff0000'
+            ))
+            
+            # Add moving averages if indicators available
+            if indicators:
+                # Add SMA 20, 50, 200
+                fig.add_trace(go.Scatter(
+                    x=plot_df['Date'], y=[indicators.sma_20]*len(plot_df),
+                    mode='lines', name='SMA 20',
+                    line=dict(color='#FFA500', width=1, dash='dot'),
+                    opacity=0.7
+                ))
+                fig.add_trace(go.Scatter(
+                    x=plot_df['Date'], y=[indicators.sma_50]*len(plot_df),
+                    mode='lines', name='SMA 50',
+                    line=dict(color='#00CED1', width=1, dash='dash'),
+                    opacity=0.7
+                ))
+                fig.add_trace(go.Scatter(
+                    x=plot_df['Date'], y=[indicators.sma_200]*len(plot_df),
+                    mode='lines', name='SMA 200',
+                    line=dict(color='#FF1493', width=2),
+                    opacity=0.8
+                ))
+            
+            # Add Fair Value Gaps (FVGs)
+            if market_structure.fair_value_gaps:
+                for idx, (fvg_low, fvg_high) in enumerate(market_structure.fair_value_gaps[-5:], 1):
+                    fig.add_hrect(
+                        y0=fvg_low, y1=fvg_high,
+                        fillcolor='#FF9800', opacity=0.15,
+                        layer='below', line_width=0,
+                        annotation_text=f"FVG{idx}",
+                        annotation_position="right"
+                    )
+                    fig.add_hline(y=fvg_low, line_color='#FF9800', line_dash='dot', opacity=0.6)
+                    fig.add_hline(y=fvg_high, line_color='#FF9800', line_dash='dot', opacity=0.6)
+            
+            # Add Order Blocks
+            if market_structure.order_blocks:
+                for idx, (ob_low, ob_high) in enumerate(market_structure.order_blocks[-3:], 1):
+                    fig.add_hrect(
+                        y0=ob_low, y1=ob_high,
+                        fillcolor='#9C27B0', opacity=0.1,
+                        layer='below', line_width=0,
+                        annotation_text=f"OB{idx}",
+                        annotation_position="right"
+                    )
+                    fig.add_hline(y=ob_low, line_color='#9C27B0', line_dash='dashdot', opacity=0.4)
+                    fig.add_hline(y=ob_high, line_color='#9C27B0', line_dash='dashdot', opacity=0.4)
+            
+            # Add Stop Loss line
+            fig.add_hline(
+                y=trade.stop_loss,
+                line_color='#ff0000',
+                line_dash='dash',
+                line_width=3,
+                annotation_text=f"STOP LOSS: ${trade.stop_loss:.2f}",
+                annotation_position="left",
+                annotation=dict(font=dict(size=12, color='white', family='Arial Black'))
+            )
+            
+            # Add Take Profit levels
+            fig.add_hline(
+                y=trade.take_profit_1,
+                line_color='#00ff00',
+                line_dash='dash',
+                line_width=3,
+                annotation_text=f"TP1: ${trade.take_profit_1:.2f}",
+                annotation_position="left",
+                annotation=dict(font=dict(size=12, color='white', family='Arial Black'))
+            )
+            
+            fig.add_hline(
+                y=trade.take_profit_2,
+                line_color='#00ff00',
+                line_dash='dash',
+                line_width=2,
+                opacity=0.7,
+                annotation_text=f"TP2: ${trade.take_profit_2:.2f}",
+                annotation_position="left",
+                annotation=dict(font=dict(size=11, color='white'))
+            )
+            
+            fig.add_hline(
+                y=trade.take_profit_3,
+                line_color='#00ff00',
+                line_dash='dash',
+                line_width=1.5,
+                opacity=0.5,
+                annotation_text=f"TP3: ${trade.take_profit_3:.2f}",
+                annotation_position="left",
+                annotation=dict(font=dict(size=10, color='white'))
+            )
+            
+            # Add entry point marker
+            entry_date = plot_df.iloc[-1]['Date']
+            entry_color = '#00ff00' if trade.action == 'BUY' else '#ff0000'
+            
+            fig.add_trace(go.Scatter(
+                x=[entry_date],
+                y=[trade.entry_price],
+                mode='markers+text',
+                marker=dict(size=20, color=entry_color, symbol='circle', line=dict(width=4, color='white')),
+                text=[f"<b>{trade.action}</b><br>${trade.entry_price:.2f}<br>{trade.confidence:.0f}% CONF"],
+                textposition="top center",
+                textfont=dict(size=14, color='white', family='Arial Black'),
+                name='Entry Signal',
+                showlegend=True
+            ))
+            
+            # ===== BUILD COMPREHENSIVE INFO PANEL =====
+            # Calculate R:R ratio
+            try:
+                rr_display = trade.reward_per_share / trade.risk_per_share if (trade.risk_per_share and trade.risk_per_share > 0 and trade.reward_per_share) else trade.risk_reward_ratio
+            except Exception:
+                rr_display = trade.risk_reward_ratio
+            
+            # Build trade details HTML
+            trade_details_html = f"""
+            <div style='background-color: rgba(26, 26, 26, 0.95); padding: 20px; border: 3px solid {entry_color}; 
+                        border-radius: 10px; font-family: monospace;  color: white; max-width: 450px;'>
+                <h2 style='color: {entry_color}; margin-top: 0;'>🎯 TRADE RECOMMENDATION</h2>
+                <h1 style='color: {entry_color}; margin: 10px 0;'>{trade.action} {ticker}</h1>
+                <p style='font-size: 16px;'><b>Confidence:</b> <span style='color: #FFD700;'>{trade.confidence:.0f}%</span> | 
+                   <b>Win Probability:</b> <span style='color: #FFD700;'>{trade.win_probability:.0f}%</span></p>
+                <hr style='border-color: {entry_color};'>
+                
+                <h3 style='color: #00CED1;'>📊 POSITION DETAILS</h3>
+                <table style='width: 100%; font-size: 14px;'>
+                    <tr><td><b>Entry Price:</b></td><td style='text-align: right;'><b>${trade.entry_price:.2f}</b></td></tr>
+                    <tr><td style='color: #ff0000;'><b>Stop Loss:</b></td><td style='text-align: right; color: #ff0000;'><b>${trade.stop_loss:.2f}</b></td></tr>
+                    <tr><td style='color: #00ff00;'><b>Take Profit 1:</b></td><td style='text-align: right; color: #00ff00;'><b>${trade.take_profit_1:.2f}</b></td></tr>
+                    <tr><td style='color: #00ff00;'><b>Take Profit 2:</b></td><td style='text-align: right; color: #00ff00;'><b>${trade.take_profit_2:.2f}</b></td></tr>
+                    <tr><td style='color: #00ff00;'><b>Take Profit 3:</b></td><td style='text-align: right; color: #00ff00;'><b>${trade.take_profit_3:.2f}</b></td></tr>
+                </table>
+                <br>
+                <table style='width: 100%; font-size: 14px;'>
+                    <tr><td><b>Position Size:</b></td><td style='text-align: right;'>{trade.position_size} shares</td></tr>
+                    <tr><td style='color: #ff0000;'><b>Risk Amount:</b></td><td style='text-align: right; color: #ff0000;'>${trade.risk_amount:.2f}</td></tr>
+                    <tr><td style='color: #00ff00;'><b>Reward Amount:</b></td><td style='text-align: right; color: #00ff00;'>${trade.reward_amount:.2f}</td></tr>
+                    <tr><td><b>Risk:Reward:</b></td><td style='text-align: right;'><b>1:{rr_display:.2f}</b></td></tr>
+                    <tr><td><b>Expected Value:</b></td><td style='text-align: right;'>${trade.expected_value:.2f}</td></tr>
+                </table>
+                
+                <hr style='border-color: {entry_color};'>
+                <h3 style='color: #FFD700;'>💡 PRIMARY THESIS</h3>
+                <p style='font-size: 13px; line-height: 1.5;'>{trade.primary_reason}</p>
+            """
+            
+            # Add Supporting Signals (categorized)
+            if trade.supporting_signals:
+                def categorize_signals(signals):
+                    bullish, bearish, neutral = [], [], []
+                    for signal in signals:
+                        s = str(signal).lower()
+                        if any(k in s for k in ("oversold", "price >", "volume above", "bullish", "macd >", "adx indicates strong")):
+                            bullish.append(signal)
+                        elif any(k in s for k in ("overbought", "price <", "low volume", "bearish", "mfi high", "macd <")):
+                            bearish.append(signal)
+                        else:
+                            neutral.append(signal)
+                    return bullish, bearish, neutral
+                
+                bullish_sigs, bearish_sigs, neutral_sigs = categorize_signals(trade.supporting_signals)
+                
+                if bullish_sigs:
+                    trade_details_html += "<h3 style='color: #00ff00;'>✓ BULLISH SIGNALS</h3><ul style='font-size: 12px;'>"
+                    for sig in bullish_sigs[:5]:
+                        trade_details_html += f"<li>{sig}</li>"
+                    trade_details_html += "</ul>"
+                
+                if bearish_sigs:
+                    trade_details_html += "<h3 style='color: #ff0000;'>✗ BEARISH SIGNALS</h3><ul style='font-size: 12px;'>"
+                    for sig in bearish_sigs[:5]:
+                        trade_details_html += f"<li>{sig}</li>"
+                    trade_details_html += "</ul>"
+                
+                if neutral_sigs:
+                    trade_details_html += "<h3 style='color: #00CED1;'>• OTHER SIGNALS</h3><ul style='font-size: 12px;'>"
+                    for sig in neutral_sigs[:5]:
+                        trade_details_html += f"<li>{sig}</li>"
+                    trade_details_html += "</ul>"
+            
+            # Add Risk Factors
+            if trade.risk_factors:
+                trade_details_html += "<hr style='border-color: #ff0000;'><h3 style='color: #ff0000;'>⚠ RISK FACTORS</h3><ul style='font-size: 12px;'>"
+                for risk in trade.risk_factors[:5]:
+                    trade_details_html += f"<li>{risk}</li>"
+                trade_details_html += "</ul>"
+            
+            trade_details_html += "</div>"
+            
+            # ===== BUILD INDICATORS PANEL =====
+            indicators_html = ""
+            if indicators:
+                indicators_html = f"""
+                <div style='background-color: rgba(15, 15, 15, 0.95); padding: 20px; border: 2px solid #4FC3F7; 
+                            border-radius: 10px; font-family: monospace; color: white; max-width: 450px; margin-top: 20px;'>
+                    <h2 style='color: #4FC3F7; margin-top: 0;'>📊 TECHNICAL INDICATORS</h2>
+                    
+                    <h3 style='color: #00CED1;'>💰 PRICE & VOLUME</h3>
+                    <table style='width: 100%; font-size: 12px;'>
+                        <tr><td>Current Price:</td><td style='text-align: right;'><b>${indicators.price:.2f}</b></td></tr>
+                        <tr><td>Open/High/Low:</td><td style='text-align: right;'>${indicators.open:.2f} / ${indicators.high:.2f} / ${indicators.low:.2f}</td></tr>
+                        <tr><td>Volume:</td><td style='text-align: right;'>{indicators.volume:,}</td></tr>
+                        <tr><td>Volume Ratio:</td><td style='text-align: right;'>{indicators.volume_ratio:.2f}x</td></tr>
+                    </table>
+                    
+                    <h3 style='color: #00CED1;'>📈 TREND</h3>
+                    <table style='width: 100%; font-size: 12px;'>
+                        <tr><td>SMA 20/50/200:</td><td style='text-align: right;'>${indicators.sma_20:.2f} / ${indicators.sma_50:.2f} / ${indicators.sma_200:.2f}</td></tr>
+                        <tr><td>EMA 12/26/50:</td><td style='text-align: right;'>${indicators.ema_12:.2f} / ${indicators.ema_26:.2f} / ${indicators.ema_50:.2f}</td></tr>
+                        <tr><td>VWAP:</td><td style='text-align: right;'>${indicators.vwap:.2f}</td></tr>
+                    </table>
+                    
+                    <h3 style='color: #00CED1;'>⚡ MOMENTUM</h3>
+                    <table style='width: 100%; font-size: 12px;'>
+                        <tr><td>RSI (14):</td><td style='text-align: right;'><b style='color: {"#ff0000" if indicators.rsi_14 > 70 else "#00ff00" if indicators.rsi_14 < 30 else "#FFD700"};'>{indicators.rsi_14:.1f}</b></td></tr>
+                        <tr><td>Stochastic K/D:</td><td style='text-align: right;'>{indicators.stochastic_k:.1f} / {indicators.stochastic_d:.1f}</td></tr>
+                        <tr><td>MACD:</td><td style='text-align: right;'>{indicators.macd:.4f}</td></tr>
+                        <tr><td>Williams %R:</td><td style='text-align: right;'>{indicators.williams_r:.1f}</td></tr>
+                        <tr><td>CCI:</td><td style='text-align: right;'>{indicators.cci:.1f}</td></tr>
+                        <tr><td>ROC(12):</td><td style='text-align: right;'>{indicators.roc_12:.2f}%</td></tr>
+                    </table>
+                    
+                    <h3 style='color: #00CED1;'>📊 VOLATILITY</h3>
+                    <table style='width: 100%; font-size: 12px;'>
+                        <tr><td>ATR:</td><td style='text-align: right;'>{indicators.atr:.2f} ({indicators.atr_percent:.2f}%)</td></tr>
+                        <tr><td>BB Upper/Lower:</td><td style='text-align: right;'>${indicators.bb_upper:.2f} / ${indicators.bb_lower:.2f}</td></tr>
+                    </table>
+                    
+                    <h3 style='color: #00CED1;'>💪 STRENGTH</h3>
+                    <table style='width: 100%; font-size: 12px;'>
+                        <tr><td>ADX:</td><td style='text-align: right;'><b>{indicators.adx:.1f}</b></td></tr>
+                        <tr><td>+DI / -DI:</td><td style='text-align: right;'>{indicators.plus_di:.1f} / {indicators.minus_di:.1f}</td></tr>
+                        <tr><td>MFI:</td><td style='text-align: right;'>{indicators.mfi:.1f}</td></tr>
+                        <tr><td>OBV:</td><td style='text-align: right;'>{indicators.obv:,.0f}</td></tr>
+                    </table>
+                    
+                    <h3 style='color: #FFD700;'>🎯 MARKET REGIME</h3>
+                    <p style='font-size: 14px;'><b>{indicators.market_regime}</b> (Confidence: {indicators.regime_confidence:.0f}%)</p>
+                </div>
+                """
+            
+            # ===== BUILD PATTERNS PANEL =====
+            patterns_html = ""
+            if patterns:
+                patterns_html = f"""
+                <div style='background-color: rgba(15, 15, 15, 0.95); padding: 20px; border: 2px solid #FF9800; 
+                            border-radius: 10px; font-family: monospace; color: white; max-width: 450px; margin-top: 20px;'>
+                    <h2 style='color: #FF9800; margin-top: 0;'>🔍 CHART PATTERNS</h2>
+                """
+                
+                if patterns.bullish_patterns:
+                    patterns_html += "<h3 style='color: #00ff00;'>📈 BULLISH PATTERNS</h3><ul style='font-size: 12px;'>"
+                    for pat in patterns.bullish_patterns:
+                        patterns_html += f"<li>{pat}</li>"
+                    patterns_html += "</ul>"
+                
+                if patterns.bearish_patterns:
+                    patterns_html += "<h3 style='color: #ff0000;'>📉 BEARISH PATTERNS</h3><ul style='font-size: 12px;'>"
+                    for pat in patterns.bearish_patterns:
+                        patterns_html += f"<li>{pat}</li>"
+                    patterns_html += "</ul>"
+                
+                if patterns.candlestick_patterns:
+                    patterns_html += "<h3 style='color: #FFD700;'>🕯️ CANDLESTICK PATTERNS</h3><ul style='font-size: 12px;'>"
+                    for pat in patterns.candlestick_patterns:
+                        patterns_html += f"<li>{pat}</li>"
+                    patterns_html += "</ul>"
+                
+                patterns_html += "</div>"
+            
+            # Combine all panels
+            all_info_html = trade_details_html + indicators_html + patterns_html
+            
+            # Add comprehensive info as annotation
+            fig.add_annotation(
+                text="",  # Empty because we'll use HTML in the layout
+                xref="paper", yref="paper",
+                x=1.02, y=1.0,
+                xanchor="left", yanchor="top",
+                showarrow=False,
+                bgcolor="rgba(0,0,0,0)"
+            )
+            
+            # Update layout with comprehensive title
+            fig.update_layout(
+                title=dict(
+                    text=f"<b>{ticker} - AI TRADE ANALYSIS | {trade.action} | CONFIDENCE: {trade.confidence:.0f}% | R:R = 1:{rr_display:.2f}</b>",
+                    font=dict(size=22, color='white', family='Arial Black'),
+                    x=0.5,
+                    xanchor='center'
+                ),
+                xaxis=dict(
+                    title='<b>Date</b>',
+                    gridcolor='#333333',
+                    showgrid=True,
+                    rangeslider=dict(visible=False),
+                    titlefont=dict(size=14, color='white')
+                ),
+                yaxis=dict(
+                    title='<b>Price ($)</b>',
+                    gridcolor='#333333',
+                    showgrid=True,
+                    titlefont=dict(size=14, color='white')
+                ),
+                plot_bgcolor='#0f0f0f',
+                paper_bgcolor='#1a1a1a',
+                font=dict(color='#cccccc', size=12),
+                hovermode='x unified',
+                height=900,
+                width=1800,
+                showlegend=True,
+                legend=dict(
+                    bgcolor='rgba(26, 26, 26, 0.9)',
+                    bordercolor='#4FC3F7',
+                    borderwidth=2,
+                    font=dict(size=12, color='white'),
+                    orientation='h',
+                    y=-0.15,
+                    x=0.5,
+                    xanchor='center'
+                ),
+                margin=dict(r=500)  # Right margin for info panels
+            )
+            
+            # Save as HTML with custom CSS to add info panels
+            html_path = chart_dir / f'analysis_{timestamp}.html'
+            
+            # Generate HTML with info panels on the side
+            html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>{ticker} - Trade Analysis</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {{
+            margin: 0;
+            padding: 20px;
+            background-color: #0a0a0a;
+            font-family: Arial, sans-serif;
+            color: white;
+        }}
+        .container {{
+            display: flex;
+            gap: 20px;
+        }}
+        .chart-container {{
+            flex: 1;
+        }}
+        .info-panels {{
+            width: 480px;
+            overflow-y: auto;
+            max-height: 95vh;
+        }}
+        h1 {{
+            text-align: center;
+            color: {entry_color};
+            margin-bottom: 20px;
+        }}
+    </style>
+</head>
+<body>
+    <h1>📊 {ticker} - AI Trading Analysis - {timestamp}</h1>
+    <div class="container">
+        <div class="chart-container" id="chart"></div>
+        <div class="info-panels">
+            {all_info_html}
+        </div>
+    </div>
+    <script>
+        {fig.to_html(include_plotlyjs=False, div_id="chart")}
+    </script>
+</body>
+</html>
+            """
+            
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            
+            return html_path
+            
+        except Exception as e:
+            logger.error(f"Interactive chart generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def _track_trade_decision(self, ticker: str, trade: TradeSummary, took_trade: bool, df: pd.DataFrame):
         """Track trade decision for future monitoring and performance tracking."""
