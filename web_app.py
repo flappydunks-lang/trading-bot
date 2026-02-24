@@ -707,7 +707,36 @@ def main_app():
                                     with feedback_container:
                                         st.error(f"❌ Error fetching Finnhub for {ticker}: {str(e)}")
                         
-                        # Format data
+                        # Display prices and news FIRST in results_container
+                        with results_container:
+                            st.markdown("---")
+                            st.subheader("📊 Data Analyzed for Recommendation")
+                            
+                            # Show prices
+                            if price_data:
+                                st.markdown("### 💰 LIVE Prices")
+                                for ticker, data in price_data.items():
+                                    arrow = "📈" if data['change'] >= 0 else "📉"
+                                    col1, col2, col3 = st.columns(3)
+                                    with col1:
+                                        st.metric(f"{data['name']} ({ticker})", f"${data['price']:.2f}", f"{data['change']:+.2f}%")
+                            else:
+                                st.warning("⚠️ No price data fetched")
+                            
+                            # Show articles
+                            if news_context:
+                                st.markdown(f"### 📰 Recent Articles ({len(news_context)} found)")
+                                for i, news in enumerate(news_context, 1):
+                                    with st.expander(f"{i}. {news['source']} - {news['headline'][:70]}..."):
+                                        st.write(f"**Source:** {news['source']}")
+                                        st.write(f"**Time:** {news['datetime']}")
+                                        st.write(f"**Headline:** {news['headline']}")
+                                        if news['summary']:
+                                            st.write(f"**Summary:** {news['summary']}")
+                            else:
+                                st.info("ℹ️ No articles found - analyzing based on price data only")
+                        
+                        # Format data for AI
                         price_summary = ""
                         if price_data:
                             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -733,7 +762,7 @@ def main_app():
                         
                         today = datetime.now().strftime('%Y-%m-%d')
                         
-                        advisor_prompt = f"""You are a trading advisor. Analyze provided data and respond with clear recommendation.
+                        advisor_prompt = f"""You are a trading advisor. Analyze provided data and respond with detailed reasoning.
 
 TODAY: {today}
 LIVE DATA
@@ -744,33 +773,40 @@ Price Data:
 News:
 {news_summary}
 
-Question: {user_question}
+User Question: {user_question}
 
-===== FORMAT REQUIRED =====
+===== RESPOND WITH EXACTLY THIS FORMAT =====
 
-**CURRENT PRICE:** [e.g., $1,847.50]
-**KEY NEWS:** [2-3 bullets]
-**ANALYSIS:** [3-4 sentences]
-**STANCE:** BULLISH or BEARISH or NEUTRAL
-**ACTION:** BUY or SELL or HOLD or WATCH
+**CURRENT PRICE:** [Show the price(s) you analyzed]
+
+**KEY NEWS FACTORS:** [List 2-3 specific news items that affect the price]
+
+**PRICE ANALYSIS:** [Explain what the price movement and news mean together - 3-4 sentences with reasoning]
+
+**STANCE:** BULLISH or BEARISH or NEUTRAL [with 1 sentence explanation]
+
+**ACTION:** BUY or SELL or HOLD or WATCH [with price target or exit level if relevant]
+
 **RISK LEVEL:** HIGH or MEDIUM or LOW
 
 ===== RULES =====
-1. Follow exact format above
-2. NO questions at end
-3. NO offers to do more
-4. Use exact numbers only
-5. Reference ONLY today's data"""
+1. CITE SPECIFIC PRICES from the data above
+2. MENTION SPECIFIC NEWS HEADLINES in your analysis
+3. EXPLAIN YOUR REASONING - why these prices + news = this recommendation
+4. NO questions at end
+5. NO offers to do more
+6. Use exact numbers only
+7. Be specific, not vague"""
                         
                         with feedback_container:
-                            st.info("🔍 Calling Groq AI for analysis...")
+                            st.info("🔍 Calling Groq AI for detailed analysis with reasoning...")
                         
                         groq_client = OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1")
                         
                         response = groq_client.chat.completions.create(
                             model="llama-3.3-70b-versatile",
                             messages=[{"role": "user", "content": advisor_prompt}],
-                            max_tokens=800,
+                            max_tokens=1000,
                             temperature=0.7
                         )
                         
@@ -787,16 +823,16 @@ Question: {user_question}
                         
                         analysis = '\n'.join(cleaned_lines).strip()
                         
-                        # SHOW RESULTS FIRST (in results_container)
+                        # SHOW AI ANALYSIS AFTER data in results_container
                         with results_container:
                             st.markdown("---")
-                            st.subheader("🎯 AI Analysis")
+                            st.subheader("🎯 AI Analysis & Recommendation")
                             st.markdown(analysis)
                             st.markdown("---")
                         
                         # Then show success in feedback container
                         with feedback_container:
-                            st.success("✅ Analysis Complete!")
+                            st.success("✅ Analysis Complete with reasoning!")
                     
                 except Exception as e:
                     with results_container:
